@@ -1,0 +1,99 @@
+services:
+  qqchat-bot:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-mirror.ccs.tencentyun.com/library/python:3.12-slim}
+    container_name: qqchat-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./workspace:/workspace
+      - ./persona.md:/app/persona.md:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    mem_limit: 512m
+    pids_limit: 100
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 容器端口只绑定环回地址，公网仅能通过 Nginx 的精确 Webhook 路径访问。
+    # 不挂载宿主机目录、SSH 凭证或 Docker Socket，Agent 只能看到专用工作区。
+
+  qwen-image-adapter:
+    build:
+      context: ./image_adapter
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-mirror.ccs.tencentyun.com/library/python:3.12-slim}
+    container_name: qwen-image-adapter
+    restart: unless-stopped
+    env_file:
+      - .image-adapter.env
+    ports:
+      - "127.0.0.1:18081:8081"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    mem_limit: 192m
+    pids_limit: 50
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  qwen-voice-adapter:
+    build:
+      context: ./voice_adapter
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-mirror.ccs.tencentyun.com/library/python:3.12-slim}
+    container_name: qwen-voice-adapter
+    restart: unless-stopped
+    # Reuse the existing isolated DashScope/client credentials. They are never
+    # mounted into the bot container.
+    env_file:
+      - .image-adapter.env
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://qqchat.example.com}
+      VOICE_MODEL: ${VOICE_MODEL:-qwen3-tts-vc-2026-01-22}
+      VOICE_PREFIX: shirley
+      VOICE_REFERENCE_PATH: /adapter/reference.wav
+      VOICE_STATE_PATH: /data/voice_id.txt
+      MAX_TEXT_CHARS: ${VOICE_MAX_CHARS:-240}
+      MAX_AUDIO_MB: ${VOICE_MAX_MB:-8}
+    ports:
+      - "127.0.0.1:18082:8082"
+    volumes:
+      - ./data/voice-adapter:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    mem_limit: 320m
+    pids_limit: 80
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

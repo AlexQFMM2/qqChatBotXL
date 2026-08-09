@@ -1,0 +1,2 @@
+"""QQ persona bot package."""
+

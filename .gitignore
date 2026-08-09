@@ -1,0 +1,14 @@
+.env
+.image-adapter.env
+data/*
+!data/.gitkeep
+workspace/*
+!workspace/.gitkeep
+__pycache__/
+.pytest_cache/
+*.pyc
+image.png
+*.log
+*.rar
+.DS_Store
+deploy/nginx/qqchat.*[0-9]*.conf
