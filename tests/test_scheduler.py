@@ -48,13 +48,15 @@ class GoodMorningSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    async def test_sends_mention_once_per_day_and_persists_it(self) -> None:
+    async def test_sends_plain_greeting_once_per_day_and_persists_it(self) -> None:
         day = date(2026, 8, 10)
         self.assertEqual(await self.scheduler.send_for_date(day), 1)
         self.assertEqual(await self.scheduler.send_for_date(day), 0)
         self.assertEqual(len(self.qq.messages), 1)
-        self.assertIn('<qqbot-at-user id="owner-openid" />', self.qq.messages[0][1])
-        self.assertIn("老师，早安", self.qq.messages[0][1])
+        self.assertEqual(self.qq.messages[0][1], "老师，早安。今天也请多指教啦。")
+        self.assertNotIn("owner-openid", self.qq.messages[0][1])
+        history = await self.store.history("group-1", 5)
+        self.assertEqual(history[-1].content, "老师，早安。今天也请多指教啦。")
         self.assertEqual(
             await self.store.get_setting("group-1", LAST_GOOD_MORNING_KEY),
             "2026-08-10",

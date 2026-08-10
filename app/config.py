@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 def _required(name: str) -> str:
@@ -117,6 +118,8 @@ class Settings:
     chat_retention_days: int
     chat_max_messages_per_group: int
     web_tools_enabled: bool
+    search_provider: str
+    searxng_base_url: str
     web_search_results: int
     web_fetch_max_kb: int
     web_fetch_max_chars: int
@@ -143,6 +146,25 @@ class Settings:
         agent_access = os.getenv("AGENT_ACCESS", "admins").strip().lower()
         if agent_access not in {"admins", "everyone"}:
             raise ValueError("AGENT_ACCESS 只能是 admins 或 everyone")
+
+        search_provider = os.getenv("SEARCH_PROVIDER", "searxng").strip().lower()
+        if search_provider != "searxng":
+            raise ValueError("SEARCH_PROVIDER 当前只能是 searxng")
+        searxng_base_url = os.getenv(
+            "SEARXNG_BASE_URL", "http://searxng:8080"
+        ).rstrip("/")
+        parsed_search_url = urlsplit(searxng_base_url)
+        if not (
+            parsed_search_url.scheme == "http"
+            and parsed_search_url.hostname == "searxng"
+            and parsed_search_url.port == 8080
+            and not parsed_search_url.username
+            and not parsed_search_url.password
+            and parsed_search_url.path in {"", "/"}
+            and not parsed_search_url.query
+            and not parsed_search_url.fragment
+        ):
+            raise ValueError("SEARXNG_BASE_URL 必须是 http://searxng:8080")
 
         raw_catalog = os.getenv("MODEL_CATALOG_JSON", "").strip()
         try:
@@ -287,7 +309,9 @@ class Settings:
                 "CHAT_MAX_MESSAGES_PER_GROUP", 1000, 100, 100000
             ),
             web_tools_enabled=_bool("WEB_TOOLS_ENABLED", True),
-            web_search_results=_int("WEB_SEARCH_RESULTS", 5, 1, 8),
+            search_provider=search_provider,
+            searxng_base_url=searxng_base_url,
+            web_search_results=_int("WEB_SEARCH_RESULTS", 8, 2, 12),
             web_fetch_max_kb=_int("WEB_FETCH_MAX_KB", 512, 64, 2048),
             web_fetch_max_chars=_int("WEB_FETCH_MAX_CHARS", 20000, 1000, 50000),
             web_request_timeout_seconds=_float(

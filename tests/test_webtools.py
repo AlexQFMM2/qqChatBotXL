@@ -3,12 +3,15 @@ from __future__ import annotations
 import unittest
 
 from app.webtools import (
+    ResearchResult,
+    ResearchSource,
     WebToolError,
     WebTools,
     format_weather,
     html_to_text,
     normalize_public_url,
     parse_bing_rss,
+    research_terms,
     validate_public_addresses,
 )
 
@@ -85,6 +88,46 @@ class ParserTests(unittest.TestCase):
         self.assertIn("上海", value)
         self.assertIn("大部晴朗", value)
         self.assertIn("27～34°C", value)
+
+
+class ResearchTests(unittest.IsolatedAsyncioTestCase):
+    def test_extracts_vndb_canonical_character_term(self) -> None:
+        self.assertEqual(
+            research_terms("夏莉·沃利克是哪部作品的角色？")[0],
+            "シャーリィ・ウォリック",
+        )
+
+    async def test_searxng_results_require_two_independent_hosts(self) -> None:
+        tools = WebTools(timeout_seconds=1)
+
+        async def fake_search(_query: str) -> list[ResearchSource]:
+            return [
+                ResearchSource("测试作品官方", "https://example.jp/a", "摘要", "searxng"),
+                ResearchSource("资料库", "https://vndb.org/v1", "摘要", "searxng"),
+            ]
+
+        async def fake_vndb(_query: str) -> list[ResearchSource]:
+            return [
+                ResearchSource(
+                    "角色记录", "https://vndb.org/c1",
+                    '{"name":"角色","vns":[{"title":"测试作品","developers":[{"name":"测试会社"}]}]}',
+                    "vndb-kana",
+                )
+            ]
+
+        tools._search_sources = fake_search  # type: ignore[method-assign]
+        tools._vndb_sources = fake_vndb  # type: ignore[method-assign]
+        result = await tools.research("这个视觉小说是哪家会社的？")
+        self.assertTrue(result.sufficient)
+        self.assertIn("独立来源是否充足：是", result.as_prompt())
+
+    def test_insufficient_result_forbids_certain_conclusion(self) -> None:
+        result = ResearchResult(
+            "问题",
+            (ResearchSource("一条", "https://vndb.org/v1", "摘要", "vndb-kana"),),
+            False,
+        )
+        self.assertIn("不能给出确定性事实结论", result.as_prompt())
 
 
 if __name__ == "__main__":

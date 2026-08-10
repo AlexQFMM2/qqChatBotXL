@@ -1,0 +1,50 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - duckduckgo
+      - brave
+      - wikipedia
+      - wikidata
+      - baidu
+      - sogou
+      - 360search
+      - naver
+
+general:
+  debug: false
+  instance_name: qqchat-internal-search
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  bind_address: 0.0.0.0
+  port: 8080
+  secret_key: qqchat-internal-only-change-via-container-network
+  limiter: false
+  image_proxy: false
+
+engines:
+  - name: bing
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false
+    language: zh
+  - name: wikidata
+    disabled: false
+  - name: baidu
+    disabled: false
+  - name: sogou
+    disabled: false
+  - name: 360search
+    disabled: false
+  - name: naver
+    disabled: false

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import tempfile
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import Settings
 from .domain import (
+    AttachmentRef,
     EMOTE_NAMES,
     build_user_prompt,
     clean_reply,
@@ -99,6 +103,18 @@ WORKSPACE_TOOLS = [
     },
 ]
 WEB_TOOLS = [
+    {
+        "name": "research",
+        "description": (
+            "对事实问题做多来源检索与核验。Galgame、视觉小说、会社、角色和作品归属"
+            "会同时查询 VNDB；结论性事实优先使用这个工具。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "需要核验的问题"}},
+            "required": ["query"],
+        },
+    },
     {
         "name": "web_search",
         "description": (
@@ -240,6 +256,35 @@ _CHAT_REFERENCE_TERMS = (
     "改图",
 )
 
+_IMAGE_CONTEXT_TERMS = (
+    "这张图", "刚才的图", "刚发的图", "上面的图", "图里", "图片里", "截图",
+    "这幅图", "上一张", "前一张", "看看图", "看图",
+)
+_FACT_CHECK_TERMS = re.compile(
+    r"(?:哪个公司|哪家公司|哪个会社|哪部作品|出自哪|角色是谁|"
+    r"发售时间|发布日期|第几集|是不是|是否是|你确定|查资料|查证|出处|"
+    r"柚子社|galgame|视觉小说|シャーリィ|沃利克)",
+    re.IGNORECASE,
+)
+_CONVERSATION_PREFIX = re.compile(
+    r"^(?:(?:可以|好的|好呀|好啊|那就|行|嗯|麻烦|拜托)(?:了|啦|吧|啊|呀)?[，,。.!！\s]*)+"
+)
+
+
+class TaskIntent(str, Enum):
+    CHAT = "chat"
+    SEARCH = "search"
+    IMAGE = "image"
+    VOICE = "voice"
+    FILE = "file"
+    PDF = "pdf"
+
+
+class TaskExecutionError(RuntimeError):
+    def __init__(self, message: str, *, notified: bool = False) -> None:
+        super().__init__(message)
+        self.notified = notified
+
 
 @dataclass(frozen=True, slots=True)
 class SavedAttachment:
@@ -254,6 +299,8 @@ class QueuedTask:
     data: dict
     group_id: str
     message_id: str
+    intent: TaskIntent = TaskIntent.CHAT
+    task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     progress_sequence: int = 1
     ready: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -301,6 +348,22 @@ class PersonaBot:
     async def start(self) -> None:
         if self._task_workers:
             return
+        await self._seed_builtin_media()
+        stale = await self._store.fail_stale_tasks()
+        for task_id, group_id, _message_id in stale:
+            try:
+                await self._qq.send_group_text(
+                    group_id,
+                    "上次服务重启前有一项任务没有完成，已经按失败结束；如果还需要，请重新发一次。",
+                )
+                await self._store.finish_task_run(
+                    task_id,
+                    succeeded=False,
+                    terminal_sent=True,
+                    error="service restarted",
+                )
+            except QQAPIError:
+                LOGGER.exception("通知遗留任务失败状态时出错")
         self._task_workers = [
             asyncio.create_task(
                 self._task_worker(index), name=f"bot-task-worker-{index}"
@@ -342,16 +405,43 @@ class PersonaBot:
             self._task_active_groups.add(group_id)
             try:
                 await task.ready.wait()
+                await self._store.start_task_run(task.task_id)
                 await self.on_event(
                     task.event_type,
                     task.data,
                     _from_task_queue=True,
                     _progress_sequence=task.progress_sequence,
+                    _task_id=task.task_id,
+                    _task_intent=task.intent,
+                )
+                await self._store.finish_task_run(
+                    task.task_id, succeeded=True, terminal_sent=True
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except TaskExecutionError as exc:
+                LOGGER.warning("后台任务 %s 失败：%s", task.task_id, exc)
+                notified = exc.notified
+                if not notified:
+                    try:
+                        await self._send(
+                            task.group_id,
+                            task.message_id,
+                            f"这次任务没有完成：{exc}",
+                            sequence=task.progress_sequence,
+                        )
+                        notified = True
+                    except QQAPIError:
+                        LOGGER.exception("后台任务失败后无法发送通知")
+                await self._store.finish_task_run(
+                    task.task_id,
+                    succeeded=False,
+                    terminal_sent=notified,
+                    error=str(exc),
+                )
+            except Exception as exc:
                 LOGGER.exception("后台任务工人 %s 处理任务失败", index)
+                notified = False
                 try:
                     await self._send(
                         task.group_id,
@@ -359,8 +449,15 @@ class PersonaBot:
                         "这次任务没有完成，后台处理时遇到了内部错误。我已经记下日志，稍后可以再试一次。",
                         sequence=task.progress_sequence,
                     )
+                    notified = True
                 except QQAPIError:
                     LOGGER.exception("后台任务失败后仍无法发送通知")
+                await self._store.finish_task_run(
+                    task.task_id,
+                    succeeded=False,
+                    terminal_sent=notified,
+                    error=str(exc),
+                )
             finally:
                 self._task_outstanding -= 1
                 self._task_active_groups.discard(group_id)
@@ -378,6 +475,8 @@ class PersonaBot:
         *,
         _from_task_queue: bool = False,
         _progress_sequence: int = 1,
+        _task_id: str | None = None,
+        _task_intent: TaskIntent = TaskIntent.CHAT,
     ) -> None:
         if event_type not in SUPPORTED_EVENTS:
             return
@@ -403,6 +502,9 @@ class PersonaBot:
         content = message_text(data)
         image_prompt = self._explicit_image_prompt(command_content)
         voice_requested = self._explicit_voice_request(command_content)
+        task_intent = self._task_intent(
+            command_content, image_prompt=image_prompt, voice_requested=voice_requested
+        )
         should_answer = voice_requested or should_reply(
             event_type,
             content,
@@ -414,22 +516,24 @@ class PersonaBot:
 
         if not _from_task_queue:
             eta: str | None = None
-            if (
+            if task_intent is TaskIntent.IMAGE and (
                 image_prompt is not None
                 and self._settings.image_generation_enabled
                 and self._agent_allowed(role, user_id)
                 and image_prompt
             ):
                 eta = "2～5 分钟"
-            elif (
+            elif task_intent is TaskIntent.VOICE and (
                 voice_requested
                 and self._settings.voice_enabled
                 and self._agent_allowed(role, user_id)
             ):
                 eta = "1～3 分钟"
-            elif voice_requested:
+            elif task_intent is TaskIntent.VOICE:
                 eta = None
-            elif should_answer or command_content.lstrip().startswith("/"):
+            elif task_intent is not TaskIntent.CHAT and (
+                should_answer or command_content.lstrip().startswith("/")
+            ):
                 eta = _task_eta(command_content)
             if eta is not None:
                 task = QueuedTask(
@@ -437,6 +541,10 @@ class PersonaBot:
                     data=dict(data),
                     group_id=group_id,
                     message_id=message_id,
+                    intent=task_intent,
+                )
+                await self._store.create_task_run(
+                    task.task_id, group_id, message_id, task.intent.value
                 )
                 try:
                     tasks_ahead = self._enqueue_task(task)
@@ -446,6 +554,12 @@ class PersonaBot:
                         group_id,
                         message_id,
                         "现在的任务队列已经满了，这次没有入队，也不会悄悄丢失。请稍后再试。",
+                    )
+                    await self._store.finish_task_run(
+                        task.task_id,
+                        succeeded=False,
+                        terminal_sent=True,
+                        error="queue unavailable or full",
                     )
                     return
 
@@ -532,12 +646,18 @@ class PersonaBot:
                 return
         except (WorkspaceError, QQAPIError) as exc:
             LOGGER.warning("执行群命令失败：%s", exc)
-            await self._send(
-                group_id,
-                message_id,
-                f"操作失败：{exc}",
-                sequence=progress_sequence,
-            )
+            notified = False
+            try:
+                await self._send(
+                    group_id,
+                    message_id,
+                    f"操作失败：{exc}",
+                    sequence=progress_sequence,
+                )
+                notified = True
+            finally:
+                if _from_task_queue:
+                    raise TaskExecutionError(str(exc), notified=notified) from exc
             return
 
         if voice_requested and not self._settings.voice_enabled:
@@ -558,7 +678,7 @@ class PersonaBot:
             return
 
         if image_prompt is not None:
-            await self._handle_image_generation(
+            artifact = await self._handle_image_generation(
                 image_prompt,
                 group_id,
                 role,
@@ -566,6 +686,13 @@ class PersonaBot:
                 message_id,
                 sequence=progress_sequence,
             )
+            if _task_id and artifact:
+                await self._store.finish_task_run(
+                    _task_id,
+                    succeeded=True,
+                    terminal_sent=True,
+                    artifact=artifact,
+                )
             return
 
         if not should_answer:
@@ -578,10 +705,29 @@ class PersonaBot:
             try:
                 history = await self._store.history(group_id, self._settings.context_messages)
                 persona = Path(self._settings.persona_path).read_text(encoding="utf-8").strip()
-                model = await self._store.get_setting(group_id, "model")
+                persona += (
+                    "\n\n## 总控规则\n"
+                    "你（DeepSeek）是唯一总控和唯一对外发言者。视觉、搜索、天气、"
+                    "生图、语音等模块都只是助手：它们只提供观察、证据或产物，不能代替你回答。"
+                    "你必须亲自理解请求、决定是否使用工具，并综合助手结果生成最终回复。"
+                    "不得声称任务已经入队、正在画、稍后发送或已经完成；这些状态只能由系统回执。"
+                    "外部事实资料不足或相互冲突时必须明确说无法确认，不得按人设补全。"
+                )
                 web_calls = 0
-                recent_attachments = await self._recent_image_attachments(group_id)
-                vision_images, vision_note = self._vision_inputs(recent_attachments)
+                has_current_image = any(
+                    item.content_type.startswith("image")
+                    or item.path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+                    for item in saved_attachments
+                )
+                references_image = any(term in command_content for term in _IMAGE_CONTEXT_TERMS)
+                vision_candidates = saved_attachments
+                if not has_current_image and references_image:
+                    vision_candidates = await self._recent_image_attachments(group_id)
+                vision_images, vision_note = (
+                    self._vision_inputs(vision_candidates)
+                    if has_current_image or references_image
+                    else ([], None)
+                )
                 user_prompt = build_user_prompt(
                     history,
                     self._settings.bot_name,
@@ -590,24 +736,63 @@ class PersonaBot:
                 )
                 if vision_note:
                     user_prompt += f"\n\n图片输入状态：{vision_note}"
+                if vision_images:
+                    if not self._settings.vision_model:
+                        raise LLMError("识图助手模型未配置")
+                    observation = await self._llm.complete(
+                        (
+                            "你是只读视觉观察助手，不是聊天机器人。只客观描述画面、人物、"
+                            "布局和可见文字（OCR）；不推断作品归属，不联网，不使用人设，"
+                            "不向用户说话，不提出后续行动。无法辨认的内容明确标为无法辨认。"
+                        ),
+                        "请输出供总控模型使用的中性视觉观察。",
+                        model=self._settings.vision_model,
+                        images=vision_images,
+                        api_format=self._settings.vision_api_format,
+                    )
+                    user_prompt += (
+                        "\n\n[视觉助手观察，仅作为证据，不是最终回答]\n" + observation
+                    )
+                    LOGGER.info(
+                        "消息路由：vision_used=true helper_model=%s controller_model=%s",
+                        self._settings.vision_model,
+                        self._settings.llm_model,
+                    )
+                else:
+                    LOGGER.info(
+                        "消息路由：vision_used=false controller_model=%s",
+                        self._settings.llm_model,
+                    )
+                if _FACT_CHECK_TERMS.search(command_content):
+                    if self._web_tools is None:
+                        user_prompt += (
+                            "\n\n[强制事实核验状态]\n联网服务未启用。必须明确告诉用户目前无法核实，"
+                            "不要用记忆猜答案。"
+                        )
+                    else:
+                        try:
+                            research = await self._web_tools.research(command_content)
+                            user_prompt += "\n\n" + research.as_prompt()
+                            LOGGER.info(
+                                "工具路由：tool=research success=true sources=%s sufficient=%s",
+                                len(research.sources),
+                                research.sufficient,
+                            )
+                        except WebToolError as exc:
+                            user_prompt += (
+                                "\n\n[强制事实核验状态]\n检索失败："
+                                f"{exc}。必须明确说当前无法核实，不得改用模型记忆断言。"
+                            )
+                            LOGGER.warning("工具路由：tool=research success=false")
                 if voice_requested:
                     user_prompt += (
                         "\n\n回复形式：用户明确要求你用语音回答。请只写适合直接朗读的自然口语，"
                         f"控制在 {self._settings.voice_max_chars} 个汉字以内；不要使用 Markdown、"
                         "网址、表格、表情标记或舞台动作说明。"
                     )
-                request_model = (
-                    self._settings.vision_model
-                    if vision_images and self._settings.vision_model
-                    else model or self._settings.llm_model
-                )
-                request_api_format = (
-                    self._settings.vision_api_format if vision_images else None
-                )
-
                 async def execute_tool(name: str, arguments: dict) -> str:
                     nonlocal next_sequence, web_calls
-                    if name in {"web_search", "fetch_url", "get_weather"}:
+                    if name in {"research", "web_search", "fetch_url", "get_weather"}:
                         if self._web_tools is None:
                             raise WebToolError("联网工具当前未启用")
                         web_calls += 1
@@ -617,6 +802,12 @@ class PersonaBot:
                             return await self._web_tools.web_search(
                                 str(arguments.get("query", ""))
                             )
+                        if name == "research":
+                            return (
+                                await self._web_tools.research(
+                                    str(arguments.get("query", ""))
+                                )
+                            ).as_prompt()
                         if name == "fetch_url":
                             return await self._web_tools.fetch_url(
                                 str(arguments.get("url", ""))
@@ -668,17 +859,13 @@ class PersonaBot:
                         user_prompt,
                         tools,
                         execute_tool,
-                        model=request_model,
-                        images=vision_images,
-                        api_format=request_api_format,
+                        model=self._settings.llm_model,
                     )
                 else:
                     raw = await self._llm.complete(
                         persona,
                         user_prompt,
-                        model=request_model,
-                        images=vision_images,
-                        api_format=request_api_format,
+                        model=self._settings.llm_model,
                     )
                 raw_reply, emote_name = extract_emote(raw, EMOTE_NAMES)
                 reply = clean_reply(
@@ -712,8 +899,9 @@ class PersonaBot:
                     await self._send_emote(
                         group_id, message_id, emote_name, sequence=next_sequence
                     )
-            except LLMError:
+            except LLMError as exc:
                 LOGGER.exception("处理群消息失败")
+                notified = False
                 try:
                     if vision_images:
                         await self._send(
@@ -729,12 +917,18 @@ class PersonaBot:
                             "刚才处理任务时出了点问题，没有完整做完。已经完成的文件可能仍在工作区；你可以用 /files 查看，或者把任务拆小一点再让我继续。",
                             sequence=next_sequence,
                         )
+                    notified = True
                 except QQAPIError:
                     LOGGER.exception("发送任务失败提示时出错")
-            except QQAPIError:
+                if _from_task_queue:
+                    raise TaskExecutionError(str(exc), notified=notified) from exc
+            except QQAPIError as exc:
                 LOGGER.exception("处理群消息失败")
-            except Exception:
+                if _from_task_queue:
+                    raise TaskExecutionError(str(exc), notified=False) from exc
+            except Exception as exc:
                 LOGGER.exception("处理群消息时出现未预期错误")
+                notified = False
                 try:
                     await self._send(
                         group_id,
@@ -742,8 +936,11 @@ class PersonaBot:
                         "这次任务没有完成，处理过程中遇到了内部错误。我已经记下日志，稍后可以再试一次。",
                         sequence=next_sequence,
                     )
+                    notified = True
                 except QQAPIError:
                     LOGGER.exception("发送未预期任务失败提示时出错")
+                if _from_task_queue:
+                    raise TaskExecutionError(str(exc), notified=notified) from exc
 
     async def _command(
         self,
@@ -763,18 +960,17 @@ class PersonaBot:
                 "复杂任务会先排好队，我会告诉你大概要等多久，完成或失败也会回来说明。\n"
                 "需要命令时可以用：/status、/model、/model list、/files、/read 路径、"
                 "/write 路径 内容、/send 路径、/voice 想说的话。"
-                "绘图、语音、文件、PDF、切换模型和管理操作会按群权限开放。"
+                "绘图、语音、文件、PDF 和管理操作会按群权限开放；DeepSeek 总控不会被切走。"
             )
         if command in {"/status", "/状态"}:
-            model = await self._store.get_setting(group_id, "model")
             group_usage_mb = self._workspace.usage_bytes(group_id) / (1024 * 1024)
             return True, (
                 f"当前回复模式：{self._settings.reply_mode}；记忆窗口："
-                f"{self._settings.context_messages} 条；模型：{model or self._settings.llm_model}；"
+                f"{self._settings.context_messages} 条；总控模型：{self._settings.llm_model}；"
                 f"联网工具：{'已启用' if self._web_tools is not None else '未启用'}；"
                 f"识图：{'已启用' if self._settings.vision_enabled else '未启用'}"
-                f"（视觉模型：{self._settings.vision_model or '跟随当前模型'}；"
-                f"视觉接口：{self._settings.vision_api_format or '跟随聊天接口'}；"
+                f"（视觉助手：{self._settings.vision_model or '未配置'}；"
+                f"视觉接口：{self._settings.vision_api_format or '跟随默认接口'}；"
                 f"图片上下文：最近 {self._settings.vision_context_messages} 条）；"
                 f"图片生成：{'已启用' if self._settings.image_generation_enabled else '未启用'}"
                 f"（{self._settings.image_generation_model}）；"
@@ -809,21 +1005,19 @@ class PersonaBot:
             return True, "用法：/voice 想让我说的话；也可以直接说“请用语音回复”。"
 
         if command in {"/model", "/模型"}:
-            model = await self._store.get_setting(group_id, "model")
-            return True, f"本群当前模型：{model or self._settings.llm_model}。用 /model list 查看可选项。"
+            return True, (
+                f"当前总控模型：{self._settings.llm_model}。DeepSeek 固定负责理解、调度和最终回复；"
+                "千问等模型只作为识图、生图或语音助手。"
+            )
         if command in {"/model list", "/模型 列表"}:
-            choices = self._settings.model_catalog or {"default": self._settings.llm_model}
-            lines = [f"{alias} → {model}" for alias, model in choices.items()]
-            return True, "可选模型：\n" + "\n".join(lines)
+            return True, (
+                f"总控（固定）：{self._settings.llm_model}\n"
+                f"视觉助手：{self._settings.vision_model or '未配置'}\n"
+                f"生图助手：{self._settings.image_generation_model}\n"
+                f"语音助手：{self._settings.voice_model}"
+            )
         if command.startswith("/model set ") or command.startswith("/模型 切换 "):
-            if role not in ADMIN_ROLES:
-                return True, "切换模型只允许群主或管理员操作。"
-            alias = raw.split(maxsplit=2)[2].strip()
-            model = self._settings.model_catalog.get(alias)
-            if not model:
-                return True, "没有这个模型简称。请先用 /model list 查看白名单。"
-            await self._store.set_setting(group_id, "model", model)
-            return True, f"本群已切换到：{alias}（{model}）。"
+            return True, "总控已固定为 DeepSeek，不能在群聊里切走；其他模型只按能力被总控调用。"
 
         if command == "/files" or command.startswith("/files "):
             if not self._agent_allowed(role):
@@ -865,18 +1059,44 @@ class PersonaBot:
             or (user_id is not None and user_id in self._settings.owner_user_ids)
         )
 
+    def _task_intent(
+        self,
+        content: str,
+        *,
+        image_prompt: str | None,
+        voice_requested: bool,
+    ) -> TaskIntent:
+        raw = re.sub(r"<@!?[^>]+>", "", content).strip()
+        if image_prompt is not None:
+            return TaskIntent.IMAGE
+        if voice_requested:
+            return TaskIntent.VOICE
+        folded = raw.casefold()
+        if "pdf" in folded and _TASK_ACTION.search(raw):
+            return TaskIntent.PDF
+        if folded.startswith(("/cleanup", "/清理", "/send ", "/write ")):
+            return TaskIntent.FILE
+        if _FACT_CHECK_TERMS.search(raw) or _FAST_TASK.search(raw):
+            return TaskIntent.SEARCH
+        return TaskIntent.CHAT
+
     def _explicit_image_prompt(self, content: str) -> str | None:
         raw = re.sub(r"<@!?[^>]+>", "", content).strip()
         for alias in sorted(self._settings.bot_aliases, key=len, reverse=True):
             if raw.casefold().startswith(alias.casefold()):
                 raw = raw[len(alias) :].lstrip(" ，,：:")
                 break
+        raw = _CONVERSATION_PREFIX.sub("", raw).strip()
         if raw.casefold().startswith("/image "):
             return raw[7:].strip()
         if raw.startswith("/画图 "):
             return raw[4:].strip()
         match = _IMAGE_REQUEST.fullmatch(raw)
         if match:
+            if raw.startswith("生成") and not re.search(
+                r"(?:图片|图|画|漫画|插画|海报|头像|壁纸|CG|cg)", raw
+            ):
+                return None
             return match.group(1).strip()
         reference_terms = _SELF_REFERENCE_TERMS + _CHAT_REFERENCE_TERMS
         if any(term in raw for term in reference_terms) and re.search(
@@ -967,18 +1187,18 @@ class PersonaBot:
         message_id: str,
         *,
         sequence: int = 1,
-    ) -> None:
+    ) -> str | None:
         if not self._settings.image_generation_enabled:
             await self._send(group_id, message_id, "图片生成功能当前没有启用。")
-            return
+            return None
         if not self._agent_allowed(role, user_id):
             await self._send(
                 group_id, message_id, "图片生成目前只允许老师、群主或管理员使用。"
             )
-            return
+            return None
         if not prompt:
             await self._send(group_id, message_id, "想画什么？把画面内容告诉我就好。")
-            return
+            return None
 
         lock = self._group_locks.setdefault(group_id, asyncio.Lock())
         async with lock:
@@ -987,10 +1207,22 @@ class PersonaBot:
                 text_plan = plan_image_text(
                     prompt, enabled=self._settings.image_text_overlay_enabled
                 )
+                directed_prompt = await self._llm.complete(
+                    (
+                        "你是图片任务的 DeepSeek 总控。把用户的绘图要求整理为一段精确、"
+                        "忠实、可直接交给生图助手的中文提示词。保留人物、构图、风格和限制；"
+                        "不要回答用户，不要承诺状态，不要写解释，不要添加用户没要求的可见文字。"
+                    ),
+                    text_plan.model_prompt,
+                    model=self._settings.llm_model,
+                )
+                directed_prompt = directed_prompt.strip()
+                if not directed_prompt:
+                    raise LLMError("DeepSeek 总控没有生成有效的绘图指令")
                 reference_images = await self._image_edit_inputs(prompt, group_id)
                 if reference_images:
                     image_url = await self._llm.edit_image(
-                        text_plan.model_prompt,
+                        directed_prompt,
                         model=self._settings.image_edit_model,
                         images=reference_images,
                     )
@@ -1002,7 +1234,7 @@ class PersonaBot:
                     )
                 else:
                     image_url = await self._llm.generate_image(
-                        text_plan.model_prompt,
+                        directed_prompt,
                         model=self._settings.image_generation_model,
                     )
                 if not _allowed_generated_image_url(image_url):
@@ -1034,15 +1266,29 @@ class PersonaBot:
                 await self._qq.send_group_file(
                     group_id, target, message_id, sequence=sequence
                 )
+                await self._store.record_sent_media(
+                    group_id,
+                    await asyncio.to_thread(_sha256_file, target),
+                    "generated_image",
+                )
+                LOGGER.info(
+                    "任务路由：intent=image controller_model=%s helper_model=%s success=true",
+                    self._settings.llm_model,
+                    self._settings.image_edit_model if reference_images else self._settings.image_generation_model,
+                )
             except (ImageTextError, LLMError, QQAPIError, WorkspaceError) as exc:
                 LOGGER.warning("生成或发送图片失败：%s", exc)
+                LOGGER.info(
+                    "任务路由：intent=image controller_model=%s success=false",
+                    self._settings.llm_model,
+                )
                 await self._send(
                     group_id,
                     message_id,
                     f"这次没画成：{exc}",
                     sequence=sequence,
                 )
-                return
+                raise TaskExecutionError(str(exc), notified=True) from exc
 
             await self._store.add(
                 group_id,
@@ -1060,6 +1306,7 @@ class PersonaBot:
                 )
             except QQAPIError:
                 LOGGER.exception("生成图片已发送，但补充文字发送失败")
+            return target.relative_to(self._workspace.group_root(group_id)).as_posix()
 
     async def run_maintenance(self) -> str:
         async with self._maintenance_lock:
@@ -1090,11 +1337,15 @@ class PersonaBot:
         return summary
 
     async def _save_attachments(
-        self, attachments: list[dict], group_id: str, message_id: str
+        self, attachments: list[AttachmentRef], group_id: str, message_id: str
     ) -> list[SavedAttachment]:
         saved: list[SavedAttachment] = []
         group_root = self._workspace.group_root(group_id)
-        for index, attachment in enumerate(attachments):
+        for index, reference in enumerate(attachments):
+            if reference.origin in {"bot_context", "user_context"}:
+                LOGGER.info("忽略非当前用户附件，来源=%s", reference.origin)
+                continue
+            attachment = reference.data
             url = str(attachment.get("url", "")).strip()
             if not url:
                 continue
@@ -1119,6 +1370,13 @@ class PersonaBot:
                 await self._qq.download_attachment(
                     url, target, min(self._workspace.max_file_bytes, remaining)
                 )
+                digest = await asyncio.to_thread(_sha256_file, target)
+                if reference.origin == "unknown_context" and await self._store.is_recent_sent_media(
+                    group_id, digest
+                ):
+                    target.unlink(missing_ok=True)
+                    LOGGER.info("忽略与机器人已发送媒体哈希一致的上下文附件")
+                    continue
                 saved.append(
                     SavedAttachment(
                         relative_path=target.relative_to(group_root).as_posix(),
@@ -1129,6 +1387,15 @@ class PersonaBot:
             except QQAPIError:
                 LOGGER.exception("保存 QQ 附件失败：%s", filename)
         return saved
+
+    async def _seed_builtin_media(self) -> None:
+        for filename in EMOTE_FILES.values():
+            path = Path(self._settings.emote_path) / filename
+            if path.is_symlink() or not path.is_file():
+                continue
+            digest = await asyncio.to_thread(_sha256_file, path)
+            # Empty group is a global fingerprint used during initial migration.
+            await self._store.record_sent_media("", digest, "emote")
 
     def _vision_inputs(
         self, attachments: list[SavedAttachment]
@@ -1298,6 +1565,9 @@ class PersonaBot:
         await self._qq.send_group_file(
             group_id, path, message_id, sequence=sequence
         )
+        await self._store.record_sent_media(
+            group_id, await asyncio.to_thread(_sha256_file, path), "emote"
+        )
         await self._store.add(
             group_id,
             "bot",
@@ -1320,3 +1590,11 @@ def _allowed_generated_image_url(url: str) -> bool:
     if not hostname.endswith(".aliyuncs.com"):
         return False
     return "dashscope" in hostname or ".oss-" in hostname
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()

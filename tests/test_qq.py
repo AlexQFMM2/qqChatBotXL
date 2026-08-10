@@ -52,6 +52,7 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
             qq_token_url="https://api.example.test/token",
             qq_app_id="app-id",
             qq_app_secret="secret",
+            owner_user_ids=frozenset({"owner-openid-value"}),
         )
         self.client = QQClient(settings, self.session)  # type: ignore[arg-type]
         self.client.auth_headers = AsyncMock(return_value={"Authorization": "test"})
@@ -66,6 +67,11 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
         payload = self.session.calls[-1]["json"]
         self.assertEqual(payload["msg_id"], "message")
         self.assertEqual(payload["msg_seq"], 3)
+
+    async def test_every_outgoing_text_path_redacts_openid(self) -> None:
+        await self.client.send_group_text("group", "老师 owner-openid-value")
+        payload = self.session.calls[-1]["json"]
+        self.assertNotIn("owner-openid-value", payload["content"])
 
 
 if __name__ == "__main__":

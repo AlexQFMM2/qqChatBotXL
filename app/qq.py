@@ -2,12 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
+import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 
 from .config import Settings
+
+LOGGER = logging.getLogger(__name__)
+_IPV4 = re.compile(
+    r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)"
+)
+_COMMON_SECRET = re.compile(
+    r"(?i)(?:bearer\s+|sk-|api[_-]?key\s*[:=]\s*)[A-Za-z0-9._-]{8,}"
+)
 
 class QQAPIError(RuntimeError):
     pass
@@ -54,6 +66,30 @@ class QQClient:
             "content-type": "application/json",
         }
 
+    def sanitize_text(self, content: str) -> str:
+        protected = {
+            str(getattr(self.settings, "qq_app_id", "")),
+            str(getattr(self.settings, "qq_app_secret", "")),
+            str(getattr(self.settings, "llm_api_key", "")),
+            str(getattr(self.settings, "llm_base_url", "")),
+            str(getattr(self.settings, "qq_api_base", "")),
+            str(getattr(self.settings, "qq_token_url", "")),
+            *getattr(self.settings, "owner_user_ids", ()),
+        }
+        for value in tuple(protected):
+            hostname = urlsplit(value).hostname if "://" in value else None
+            if hostname:
+                protected.add(hostname)
+        safe = content
+        for value in sorted(protected, key=len, reverse=True):
+            if len(value) >= 6:
+                safe = re.sub(re.escape(value), "[内部信息已隐藏]", safe, flags=re.I)
+        safe = _COMMON_SECRET.sub("[内部信息已隐藏]", safe)
+        safe = _IPV4.sub("[内部信息已隐藏]", safe)
+        if safe != content:
+            LOGGER.warning("群消息发送前发现并隐藏了内部信息")
+        return safe
+
     async def send_group_text(
         self,
         group_id: str,
@@ -65,7 +101,7 @@ class QQClient:
         url = f"{self.settings.qq_api_base}/v2/groups/{group_id}/messages"
         payload = {
             "msg_type": 0,
-            "content": content,
+            "content": self.sanitize_text(content),
         }
         # msg_id/msg_seq are only valid when replying to an incoming message.
         # Proactive messages (for example scheduled greetings) omit both fields.

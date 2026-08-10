@@ -42,6 +42,12 @@ class ChatLine:
     user_id: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class AttachmentRef:
+    data: dict
+    origin: str
+
+
 def should_reply(
     event_type: str,
     content: str,
@@ -82,12 +88,11 @@ def attachment_summary(message: dict) -> str:
     return " ".join(parts)
 
 
-def message_attachments(message: dict, max_items: int = 20) -> list[dict]:
+def message_attachments(message: dict, max_items: int = 20) -> list[AttachmentRef]:
     """Collect top-level and nested QQ attachments without trusting their paths."""
-    collected: list[dict] = []
+    collected: list[AttachmentRef] = []
     seen_urls: set[str] = set()
-
-    def add(attachment: dict) -> None:
+    def add(attachment: dict, origin: str) -> None:
         if len(collected) >= max_items:
             return
         url = str(attachment.get("url", "")).strip()
@@ -95,21 +100,34 @@ def message_attachments(message: dict, max_items: int = 20) -> list[dict]:
         if dedupe_key in seen_urls:
             return
         seen_urls.add(dedupe_key)
-        collected.append(attachment)
+        collected.append(AttachmentRef(attachment, origin))
 
-    def visit(node: dict, depth: int) -> None:
+    def node_origin(node: dict, *, top_level: bool) -> str:
+        if top_level:
+            return "current_user"
+        author = node.get("author") if isinstance(node.get("author"), dict) else {}
+        if author.get("bot"):
+            return "bot_context"
+        author_id = str(author.get("member_openid") or author.get("id") or "")
+        username = str(author.get("username") or "")
+        if author_id or username:
+            return "user_context"
+        return "unknown_context"
+
+    def visit(node: dict, depth: int, *, top_level: bool = False) -> None:
         if depth > 4 or len(collected) >= max_items:
             return
+        origin = node_origin(node, top_level=top_level)
         for attachment in node.get("attachments") or []:
             if not isinstance(attachment, dict):
                 continue
-            add(attachment)
+            add(attachment, origin)
             if len(collected) >= max_items:
                 return
         for attachment in _qq_serialized_attachments(
             str(node.get("content", "")), max_items - len(collected)
         ):
-            add(attachment)
+            add(attachment, origin)
             if len(collected) >= max_items:
                 return
         for element in node.get("msg_elements") or []:
@@ -118,7 +136,7 @@ def message_attachments(message: dict, max_items: int = 20) -> list[dict]:
                 if len(collected) >= max_items:
                     return
 
-    visit(message, 0)
+    visit(message, 0, top_level=True)
     return collected
 
 
@@ -191,7 +209,10 @@ def message_elements_summary(message: dict, max_items: int = 20) -> str:
                 else ""
             )
             if combined:
-                prefix = f"{username}: " if username else ""
+                if isinstance(author, dict) and author.get("bot"):
+                    prefix = "夏莉（你）: "
+                else:
+                    prefix = f"{username}: " if username else ""
                 lines.append(f"{prefix}{combined}")
             visit(element.get("msg_elements"), depth + 1)
 

@@ -64,6 +64,30 @@ class MemoryStore:
                 setting_value TEXT NOT NULL,
                 PRIMARY KEY(group_id, setting_key)
             );
+            CREATE TABLE IF NOT EXISTS sent_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sent_media_group_hash
+                ON sent_media(group_id, sha256, created_at DESC);
+            CREATE TABLE IF NOT EXISTS task_runs (
+                task_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                status TEXT NOT NULL,
+                artifact TEXT,
+                error TEXT,
+                terminal_sent INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_runs_status
+                ON task_runs(status, created_at);
             """
         )
         self._db.commit()
@@ -169,6 +193,103 @@ class MemoryStore:
                 (group_id, group_id, message_limit, image_limit),
             ).fetchall()
         return [(str(row[0]), str(row[1])) for row in reversed(rows)]
+
+    async def record_sent_media(
+        self, group_id: str, sha256: str, media_type: str
+    ) -> None:
+        async with self._lock:
+            self._db.execute(
+                "INSERT INTO sent_media(group_id, sha256, media_type, created_at) VALUES (?, ?, ?, ?)",
+                (group_id, sha256, media_type, int(time.time())),
+            )
+            self._db.commit()
+
+    async def is_recent_sent_media(
+        self, group_id: str, sha256: str, retention_days: int = 30
+    ) -> bool:
+        cutoff = int(time.time()) - retention_days * 86400
+        async with self._lock:
+            row = self._db.execute(
+                """
+                SELECT 1 FROM sent_media
+                WHERE group_id IN (?, '') AND sha256 = ? AND created_at >= ?
+                LIMIT 1
+                """,
+                (group_id, sha256, cutoff),
+            ).fetchone()
+        return row is not None
+
+    async def create_task_run(
+        self, task_id: str, group_id: str, message_id: str, intent: str
+    ) -> None:
+        async with self._lock:
+            self._db.execute(
+                """
+                INSERT OR REPLACE INTO task_runs(
+                    task_id, group_id, message_id, intent, status, artifact, error,
+                    terminal_sent, created_at, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, 'queued', NULL, NULL, 0, ?, NULL, NULL)
+                """,
+                (task_id, group_id, message_id, intent, int(time.time())),
+            )
+            self._db.commit()
+
+    async def start_task_run(self, task_id: str) -> None:
+        async with self._lock:
+            self._db.execute(
+                "UPDATE task_runs SET status = 'running', started_at = ? WHERE task_id = ?",
+                (int(time.time()), task_id),
+            )
+            self._db.commit()
+
+    async def finish_task_run(
+        self,
+        task_id: str,
+        *,
+        succeeded: bool,
+        terminal_sent: bool,
+        artifact: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        async with self._lock:
+            self._db.execute(
+                """
+                UPDATE task_runs
+                SET status = ?, artifact = COALESCE(?, artifact),
+                    error = COALESCE(?, error), terminal_sent = ?, finished_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    "succeeded" if succeeded else "failed",
+                    artifact,
+                    (error or "")[:500] or None,
+                    int(terminal_sent),
+                    int(time.time()),
+                    task_id,
+                ),
+            )
+            self._db.commit()
+
+    async def fail_stale_tasks(self) -> list[tuple[str, str, str]]:
+        async with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT task_id, group_id, message_id FROM task_runs
+                WHERE status IN ('queued', 'running')
+                ORDER BY created_at
+                """
+            ).fetchall()
+            now = int(time.time())
+            self._db.execute(
+                """
+                UPDATE task_runs
+                SET status = 'failed', error = 'service restarted', finished_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (now,),
+            )
+            self._db.commit()
+        return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     async def get_setting(self, group_id: str, key: str) -> str | None:
         async with self._lock:

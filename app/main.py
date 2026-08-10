@@ -75,6 +75,8 @@ async def run() -> None:
                 max_bytes=settings.web_fetch_max_kb * 1024,
                 max_chars=settings.web_fetch_max_chars,
                 search_results=settings.web_search_results,
+                search_provider=settings.search_provider,
+                searxng_base_url=settings.searxng_base_url,
             )
             if settings.web_tools_enabled
             else None
@@ -114,7 +116,8 @@ async def run() -> None:
         )
 
         logger.info(
-            "qqchat-bot Webhook 已启动，回复模式：%s，后台任务工人：%s",
+            "qqchat-bot Webhook 已启动，总控模型：%s，回复模式：%s，后台任务工人：%s",
+            settings.llm_model,
             settings.reply_mode,
             settings.task_queue_workers,
         )

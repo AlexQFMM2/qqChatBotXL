@@ -20,12 +20,17 @@ class ExplicitImageRequestTests(unittest.TestCase):
             "一只白猫",
         )
         self.assertEqual(self.bot._explicit_image_prompt("画一张星空"), "星空")
+        self.assertEqual(
+            self.bot._explicit_image_prompt("可以，生成四格漫画"), "四格漫画"
+        )
 
     def test_accepts_slash_command(self) -> None:
         self.assertEqual(self.bot._explicit_image_prompt("/image watercolor fox"), "watercolor fox")
 
     def test_does_not_trigger_on_capability_question(self) -> None:
         self.assertIsNone(self.bot._explicit_image_prompt("你能生成图片吗？"))
+        self.assertIsNone(self.bot._explicit_image_prompt("生成一份 PDF 报告"))
+        self.assertIsNone(self.bot._explicit_image_prompt("生成一条语音"))
 
     def test_accepts_self_and_chat_reference_requests(self) -> None:
         self.assertEqual(

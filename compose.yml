@@ -24,6 +24,9 @@ services:
     mem_limit: 512m
     pids_limit: 100
     init: true
+    depends_on:
+      searxng:
+        condition: service_healthy
     logging:
       driver: json-file
       options:
@@ -31,6 +34,35 @@ services:
         max-file: "3"
     # 容器端口只绑定环回地址，公网仅能通过 Nginx 的精确 Webhook 路径访问。
     # 不挂载宿主机目录、SSH 凭证或 Docker Socket，Agent 只能看到专用工作区。
+
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    container_name: qqchat-searxng
+    restart: unless-stopped
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    mem_limit: 384m
+    pids_limit: 80
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   qwen-image-adapter:
     build:

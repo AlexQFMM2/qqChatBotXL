@@ -43,14 +43,9 @@ class GoodMorningScheduler:
     async def send_for_date(self, day: date) -> int:
         """Send greetings not already persisted for *day*. Returns sent group count."""
         day_key = day.isoformat()
-        owner_mentions = " ".join(
-            f'<qqbot-at-user id="{owner_id}" />'
-            for owner_id in sorted(self._settings.owner_user_ids)
-        )
-        content = (
-            f"{owner_mentions} {self._settings.owner_title}，早安。"
-            "今天也请多指教啦。"
-        )
+        raw_content = "老师，早安。今天也请多指教啦。"
+        sanitizer = getattr(self._qq, "sanitize_text", None)
+        content = sanitizer(raw_content) if callable(sanitizer) else raw_content
         sent = 0
         for group_id in sorted(self._settings.good_morning_groups):
             if await self._store.get_setting(group_id, LAST_GOOD_MORNING_KEY) == day_key:
@@ -69,12 +64,12 @@ class GoodMorningScheduler:
                 raise
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                LOGGER.exception("向群 %s 发送定时早安失败", group_id)
+                LOGGER.exception("发送定时早安失败（群标识不写入日志）")
                 continue
             sent += 1
             self.last_success_at = datetime.now(BEIJING).isoformat()
             self.last_error = None
-            LOGGER.info("已向群 %s 发送定时早安", group_id)
+            LOGGER.info("已发送定时早安（群标识不写入日志）")
         return sent
 
     async def run(self, stop: asyncio.Event) -> None:

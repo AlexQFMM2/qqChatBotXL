@@ -54,6 +54,21 @@ class AttachmentContextTests(unittest.IsolatedAsyncioTestCase):
         await self.store.reset_group("group")
         self.assertEqual(await self.store.recent_image_attachments("group", 20, 4), [])
 
+    async def test_global_and_group_sent_media_hashes_are_recognized(self) -> None:
+        await self.store.record_sent_media("", "builtin-hash", "emote")
+        await self.store.record_sent_media("group", "generated-hash", "generated_image")
+        self.assertTrue(await self.store.is_recent_sent_media("group", "builtin-hash"))
+        self.assertTrue(await self.store.is_recent_sent_media("group", "generated-hash"))
+        self.assertFalse(await self.store.is_recent_sent_media("other", "generated-hash"))
+
+    async def test_task_run_is_failed_after_restart(self) -> None:
+        await self.store.create_task_run("one", "group", "message", "image")
+        await self.store.start_task_run("one")
+        self.assertEqual(
+            await self.store.fail_stale_tasks(),
+            [("one", "group", "message")],
+        )
+
     async def test_cleanup_prunes_old_and_excess_chat_rows(self) -> None:
         now = 2_000_000_000
         with patch("app.storage.time.time", return_value=now):

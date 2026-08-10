@@ -93,7 +93,26 @@ class FormattingTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual(value, [duplicate, nested])
+        self.assertEqual([item.data for item in value], [duplicate, nested])
+        self.assertEqual([item.origin for item in value], ["current_user", "unknown_context"])
+
+    def test_marks_nested_bot_media_with_provenance(self) -> None:
+        value = message_attachments(
+            {
+                "author": {"member_openid": "user", "username": "小明"},
+                "msg_elements": [
+                    {
+                        "author": {"bot": True, "username": "夏莉"},
+                        "attachments": [{"content_type": "image/png", "url": "https://qq.test/bot"}],
+                    },
+                    {
+                        "author": {"member_openid": "other", "username": "小红"},
+                        "attachments": [{"content_type": "image/png", "url": "https://qq.test/other"}],
+                    },
+                ],
+            }
+        )
+        self.assertEqual([item.origin for item in value], ["bot_context", "user_context"])
 
     def test_recovers_qq_images_serialized_inside_context_text(self) -> None:
         content = (
@@ -106,10 +125,10 @@ class FormattingTests(unittest.TestCase):
         )
         value = message_attachments({"msg_elements": [{"content": content}]})
         self.assertEqual(len(value), 2)
-        self.assertEqual(value[0]["filename"], "first.png")
-        self.assertEqual(value[0]["content_type"], "image/png")
-        self.assertEqual(value[1]["filename"], "second.jpg")
-        self.assertEqual(value[1]["content_type"], "image/jpeg")
+        self.assertEqual(value[0].data["filename"], "first.png")
+        self.assertEqual(value[0].data["content_type"], "image/png")
+        self.assertEqual(value[1].data["filename"], "second.jpg")
+        self.assertEqual(value[1].data["content_type"], "image/jpeg")
         summary = message_text({"msg_elements": [{"content": content}]})
         self.assertNotIn("https://", summary)
         self.assertIn("URL:[已由系统安全接收]", summary)
