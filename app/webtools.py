@@ -51,10 +51,11 @@ class ResearchResult:
             f"问题：{self.query}",
             f"独立来源是否充足：{'是' if self.sufficient else '否'}",
         ]
-        for index, source in enumerate(self.sources, 1):
+        for index, source in enumerate(self.sources[:6], 1):
+            summary = (source.summary or "无摘要")[:500]
             lines.append(
                 f"{index}. {source.title}\n来源：{source.url}\n"
-                f"摘要：{source.summary or '无摘要'}\n检索器：{source.provider}"
+                f"摘要：{summary}\n检索器：{source.provider}"
             )
         if not self.sufficient:
             lines.append("约束：独立来源不足两个，不能给出确定性事实结论。")

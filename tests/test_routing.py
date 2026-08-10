@@ -61,7 +61,10 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
 class ControllerIntentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bot = PersonaBot.__new__(PersonaBot)
-        self.bot._settings = SimpleNamespace(bot_aliases=("夏莉",))
+        self.bot._settings = SimpleNamespace(
+            bot_aliases=("夏莉",), agent_access="admins", owner_user_ids=frozenset()
+        )
+        self.bot._web_tools = object()
 
     def test_only_bound_work_is_queued(self) -> None:
         self.assertEqual(
@@ -77,6 +80,14 @@ class ControllerIntentTests(unittest.TestCase):
             self.bot._task_intent("查资料：夏莉出自哪部作品", image_prompt=None, voice_requested=False),
             TaskIntent.SEARCH,
         )
+
+    def test_prefetched_fact_query_does_not_expose_search_tools_again(self) -> None:
+        tools = self.bot._tools_for_request(
+            fact_check_requested=True,
+            role="member",
+            task_intent=TaskIntent.SEARCH,
+        )
+        self.assertEqual(tools, [])
 
 
 if __name__ == "__main__":

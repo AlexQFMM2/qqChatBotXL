@@ -121,6 +121,29 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", final_payload)
         self.assertIn("工具调用轮次已达到上限", final_payload["messages"][-1]["content"][-1]["text"])
 
+    async def test_plain_anthropic_empty_response_retries_with_larger_budget(self) -> None:
+        from app.llm import LLMClient
+
+        client = LLMClient(self._settings(), None)
+        client._post = AsyncMock(
+            side_effect=[
+                {
+                    "content": [],
+                    "stop_reason": "max_tokens",
+                    "usage": {"output_tokens": 200},
+                },
+                {"content": [{"type": "text", "text": "恢复后的回答"}]},
+            ]
+        )
+
+        result = await client.complete("system", "user")
+
+        self.assertEqual(result, "恢复后的回答")
+        recovery_payload = client._post.await_args_list[-1].args[2]
+        self.assertEqual(recovery_payload["max_tokens"], 1600)
+        self.assertEqual(recovery_payload["temperature"], 0.4)
+        self.assertIn("立即输出", recovery_payload["system"])
+
     async def test_empty_text_after_tool_gets_no_tool_recovery(self) -> None:
         from app.llm import LLMClient
 
@@ -150,6 +173,7 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._post.await_count, 3)
         recovery_payload = client._post.await_args_list[-1].args[2]
         self.assertNotIn("tools", recovery_payload)
+        self.assertEqual(recovery_payload["max_tokens"], 1600)
         self.assertIn("不要再调用工具", recovery_payload["messages"][-1]["content"][0]["text"])
 
 

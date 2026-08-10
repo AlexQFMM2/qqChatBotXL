@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from typing import Sequence
 import aiohttp
 
 from .config import Settings
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
@@ -188,8 +192,8 @@ class LLMClient:
                 )
                 recovery_payload = {
                     "model": model or self._settings.llm_model,
-                    "max_tokens": self._settings.llm_max_tokens,
-                    "temperature": self._settings.llm_temperature,
+                    "max_tokens": self._recovery_max_tokens(),
+                    "temperature": min(self._settings.llm_temperature, 0.4),
                     "system": system,
                     "messages": messages,
                 }
@@ -201,6 +205,7 @@ class LLMClient:
                     if part.get("type") == "text"
                 ).strip()
                 if not recovery_text:
+                    self._log_empty_response("tool_recovery", recovery_data)
                     raise LLMError("模型执行工具后重试仍没有返回文本")
                 return recovery_text
 
@@ -258,6 +263,26 @@ class LLMClient:
         if not final_text:
             raise LLMError("工具调用达到上限后，模型没有返回任务总结")
         return final_text
+
+    def _recovery_max_tokens(self) -> int:
+        return min(8192, max(1600, self._settings.llm_max_tokens * 2))
+
+    @staticmethod
+    def _log_empty_response(stage: str, data: dict) -> None:
+        content = data.get("content")
+        content_types = (
+            [str(part.get("type", "unknown")) for part in content if isinstance(part, dict)]
+            if isinstance(content, list)
+            else []
+        )
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        LOGGER.warning(
+            "模型空响应：stage=%s stop_reason=%s content_types=%s output_tokens=%s",
+            stage,
+            data.get("stop_reason"),
+            content_types,
+            usage.get("output_tokens"),
+        )
 
     async def generate_image(self, prompt: str, *, model: str) -> str:
         """Generate an image through the gateway's OpenAI-compatible chat API."""
@@ -396,7 +421,27 @@ class LLMClient:
         parts = data.get("content") or []
         text = "".join(str(part.get("text", "")) for part in parts if part.get("type") == "text")
         if not text.strip():
-            raise LLMError("模型返回中没有文本内容")
+            self._log_empty_response("anthropic_initial", data)
+            recovery_payload = {
+                **payload,
+                "max_tokens": self._recovery_max_tokens(),
+                "temperature": min(self._settings.llm_temperature, 0.4),
+                "system": (
+                    system
+                    + "\n\n恢复指令：上一轮没有产生可见文本。立即输出可直接发送给用户的最终回答；"
+                    "不要继续隐藏分析，不要调用工具，不要只输出思考过程。"
+                ),
+            }
+            recovery_data = await self._post(url, headers, recovery_payload)
+            recovery_parts = recovery_data.get("content") or []
+            text = "".join(
+                str(part.get("text", ""))
+                for part in recovery_parts
+                if part.get("type") == "text"
+            )
+            if not text.strip():
+                self._log_empty_response("anthropic_recovery", recovery_data)
+                raise LLMError("模型重试后仍没有返回文本内容")
         return text
 
     async def _openai(

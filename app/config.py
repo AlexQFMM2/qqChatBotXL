@@ -209,7 +209,7 @@ class Settings:
                 if str(key).strip() and str(value).strip()
             },
             llm_api_format=api_format,
-            llm_max_tokens=_int("LLM_MAX_TOKENS", 700, 32, 8192),
+            llm_max_tokens=_int("LLM_MAX_TOKENS", 1200, 32, 8192),
             llm_temperature=_float("LLM_TEMPERATURE", 0.8, 0.0, 2.0),
             reply_mode=reply_mode,
             smart_reply_probability=_float("SMART_REPLY_PROBABILITY", 0.06, 0.0, 1.0),

@@ -129,6 +129,18 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("不能给出确定性事实结论", result.as_prompt())
 
+    def test_evidence_prompt_caps_sources_and_summary_length(self) -> None:
+        sources = tuple(
+            ResearchSource(
+                f"来源{index}", f"https://source{index}.example/a", "摘" * 800, "searxng"
+            )
+            for index in range(8)
+        )
+        prompt = ResearchResult("问题", sources, True).as_prompt()
+        self.assertIn("来源5", prompt)
+        self.assertNotIn("来源6", prompt)
+        self.assertLess(len(prompt), 4000)
+
 
 if __name__ == "__main__":
     unittest.main()

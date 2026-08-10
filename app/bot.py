@@ -763,7 +763,8 @@ class PersonaBot:
                         "消息路由：vision_used=false controller_model=%s",
                         self._settings.llm_model,
                     )
-                if _FACT_CHECK_TERMS.search(command_content):
+                fact_check_requested = bool(_FACT_CHECK_TERMS.search(command_content))
+                if fact_check_requested:
                     if self._web_tools is None:
                         user_prompt += (
                             "\n\n[强制事实核验状态]\n联网服务未启用。必须明确告诉用户目前无法核实，"
@@ -850,9 +851,14 @@ class PersonaBot:
                         return f"已把 {path.name} 发送到群里"
                     raise WorkspaceError(f"不支持的工具：{name}")
 
-                tools = list(WEB_TOOLS) if self._web_tools is not None else []
-                if self._agent_allowed(role):
-                    tools.extend(WORKSPACE_TOOLS)
+                # Forced factual research has already produced an evidence bundle.
+                # Do not expose search tools again: repeated searches made some
+                # reasoning models spend the whole response budget without visible text.
+                tools = self._tools_for_request(
+                    fact_check_requested=fact_check_requested,
+                    role=role,
+                    task_intent=task_intent,
+                )
                 if tools:
                     raw = await self._llm.complete_with_tools(
                         persona,
@@ -1058,6 +1064,24 @@ class PersonaBot:
             or role in ADMIN_ROLES
             or (user_id is not None and user_id in self._settings.owner_user_ids)
         )
+
+    def _tools_for_request(
+        self,
+        *,
+        fact_check_requested: bool,
+        role: str,
+        task_intent: TaskIntent,
+    ) -> list[dict]:
+        tools = (
+            list(WEB_TOOLS)
+            if self._web_tools is not None and not fact_check_requested
+            else []
+        )
+        if self._agent_allowed(role) and (
+            not fact_check_requested or task_intent in {TaskIntent.FILE, TaskIntent.PDF}
+        ):
+            tools.extend(WORKSPACE_TOOLS)
+        return tools
 
     def _task_intent(
         self,
