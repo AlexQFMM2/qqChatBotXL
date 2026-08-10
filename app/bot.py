@@ -257,9 +257,15 @@ _CHAT_REFERENCE_TERMS = (
 )
 
 _IMAGE_CONTEXT_TERMS = (
-    "这张图", "刚才的图", "刚发的图", "上面的图", "图里", "图片里", "截图",
-    "这幅图", "上一张", "前一张", "看看图", "看图",
+    "这张图", "这张图片", "这个图片", "这幅图", "刚才的图", "刚才的图片",
+    "刚发的图", "刚发的图片", "上面的图", "上一张", "前一张", "图里", "图中",
+    "图上", "图片里", "图片中", "图片上", "图片内容", "截图", "看看图", "看图",
+    "识图", "识别图片", "分析图片", "读图",
 )
+
+
+def _references_image(content: str) -> bool:
+    return any(term in content for term in _IMAGE_CONTEXT_TERMS)
 _FACT_CHECK_TERMS = re.compile(
     r"(?:哪个公司|哪家公司|哪个会社|哪部作品|出自哪|角色是谁|"
     r"发售时间|发布日期|最新作|最新作品|新作|最近作品|第几集|是不是|是否是|你确定|查资料|查证|出处|"
@@ -744,19 +750,27 @@ class PersonaBot:
                     "外部事实资料不足或相互冲突时必须明确说无法确认，不得按人设补全。"
                 )
                 web_calls = 0
-                has_current_image = any(
-                    item.content_type.startswith("image")
-                    or item.path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+                current_image_attachments = [
+                    item
                     for item in saved_attachments
-                )
-                references_image = any(term in command_content for term in _IMAGE_CONTEXT_TERMS)
-                vision_candidates = saved_attachments
-                if not has_current_image and references_image:
-                    vision_candidates = await self._recent_image_attachments(group_id)
-                vision_images, vision_note = (
-                    self._vision_inputs(vision_candidates)
-                    if has_current_image or references_image
-                    else ([], None)
+                    if item.content_type.startswith("image")
+                    or item.path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+                ]
+                references_image = _references_image(command_content)
+                vision_candidates: list[SavedAttachment] = []
+                vision_note: str | None = None
+                if references_image:
+                    vision_candidates = current_image_attachments
+                    if not vision_candidates:
+                        vision_candidates = await self._recent_image_attachments(group_id)
+                    if vision_candidates:
+                        vision_images, vision_note = self._vision_inputs(vision_candidates)
+                    else:
+                        vision_note = "最近 20 条消息里没有找到可用图片，不能猜测图片内容。"
+                LOGGER.info(
+                    "图片路由：explicit_reference=%s candidates=%s",
+                    references_image,
+                    len(vision_candidates),
                 )
                 user_prompt = build_user_prompt(
                     history,

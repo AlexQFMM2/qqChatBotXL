@@ -35,6 +35,11 @@ _QQ_MEDIA_HOSTS = frozenset({"multimedia.nt.qq.com.cn"})
 _QQ_SERIALIZED_ATTACHMENT_BLOCK_RE = re.compile(
     r"(?ms)^[ \t]*\[附件\d*\].*?(?=\n[ \t]*\n|\n===|\n\[当前消息\]|\n\[消息内容\]|\Z)"
 )
+_MODEL_IMAGE_MARKER_RE = re.compile(
+    r"\s*(?:\[图片\]|\[发送表情：[^\]]+\]|"
+    r"\[附件已保存：[^\]]+\.(?:jpe?g|png|gif|webp)\])",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +212,11 @@ def strip_qq_context_media(content: str) -> str:
     return "\n".join(lines).strip()
 
 
+def strip_model_image_markers(content: str) -> str:
+    """Hide image availability metadata from the conversational controller."""
+    return _MODEL_IMAGE_MARKER_RE.sub("", content).strip()
+
+
 def message_elements_summary(message: dict, max_items: int = 20) -> str:
     """Render QQ-provided mention/quote context into a bounded text transcript."""
     lines: list[str] = []
@@ -267,13 +277,16 @@ def build_user_prompt(
     line_list = list(lines)
     transcript = []
     for line in line_list:
+        visible_content = strip_model_image_markers(line.content)
+        if not visible_content:
+            continue
         if line.is_bot:
             speaker = f"{bot_name}（你）"
         elif line.user_id and line.user_id in owners:
             speaker = f"{owner_title}（你唯一绑定的开发者，OpenID 已验证）"
         else:
             speaker = line.username
-        transcript.append(f"{speaker}: {line.content}")
+        transcript.append(f"{speaker}: {visible_content}")
     relationship_note = ""
     if line_list and line_list[-1].user_id in owners:
         relationship_note = (

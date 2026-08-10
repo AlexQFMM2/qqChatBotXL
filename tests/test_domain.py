@@ -179,6 +179,20 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("小明: 早", value)
         self.assertIn("小Q（你）: 早上好", value)
 
+    def test_build_prompt_hides_image_availability_markers(self) -> None:
+        value = build_user_prompt(
+            [
+                ChatLine("小明", "[图片] [附件已保存：inbox/a.png]"),
+                ChatLine("夏莉", "[发送表情：害羞]", True),
+                ChatLine("小明", "聊聊柚子社"),
+            ],
+            "夏莉",
+        )
+        self.assertNotIn("图片", value)
+        self.assertNotIn("附件已保存", value)
+        self.assertNotIn("发送表情", value)
+        self.assertIn("聊聊柚子社", value)
+
     def test_build_prompt_accepts_persona_name(self) -> None:
         value = build_user_prompt([ChatLine("旧名字", "你好", True)], "夏莉")
         self.assertIn("夏莉（你）: 你好", value)

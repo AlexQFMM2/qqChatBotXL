@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.bot import PersonaBot, TaskIntent, _sha256_file
+from app.bot import PersonaBot, TaskIntent, _references_image, _sha256_file
 from app.domain import AttachmentRef
 from app.storage import MemoryStore
 from app.workspace import GroupWorkspace
@@ -113,6 +113,12 @@ class ControllerIntentTests(unittest.TestCase):
             ),
             TaskIntent.SEARCH,
         )
+
+    def test_vision_requires_explicit_image_reference(self) -> None:
+        self.assertTrue(_references_image("帮我看下这个图片"))
+        self.assertTrue(_references_image("识别一下刚才的图"))
+        self.assertFalse(_references_image("柚子社最新作是什么"))
+        self.assertFalse(_references_image("生成一张图片"))
 
 
 if __name__ == "__main__":
