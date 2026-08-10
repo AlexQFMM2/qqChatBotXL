@@ -8,6 +8,7 @@ import re
 import socket
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import date
 from html.parser import HTMLParser
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
@@ -25,6 +26,7 @@ ALLOWED_CONTENT_TYPES = {
     "application/xml",
     "text/xml",
 }
+LATEST_WORK_RE = re.compile(r"(?:最新作品|最新作|最近作品|新作)", re.IGNORECASE)
 
 
 class WebToolError(RuntimeError):
@@ -51,6 +53,11 @@ class ResearchResult:
             f"问题：{self.query}",
             f"独立来源是否充足：{'是' if self.sufficient else '否'}",
         ]
+        if LATEST_WORK_RE.search(self.query):
+            lines.append(
+                f"时间基准：{date.today().isoformat()}。必须区分“已发售的最新作”和"
+                "“已公布但尚未发售的新作”，不得把两者混为一谈。"
+            )
         for index, source in enumerate(self.sources[:6], 1):
             summary = (source.summary or "无摘要")[:500]
             lines.append(
@@ -191,7 +198,7 @@ def research_terms(query: str) -> tuple[str, ...]:
                 candidates.append(value)
     cleaned = re.sub(
         r"(?:请|帮我|查一下|查询|搜索|查资料|查证|你确定|角色|哪个公司|哪家公司|"
-        r"哪个会社|哪部作品|出自|发售时间|是不是|是否|制作|开发|的|是|吗|呢|？|\?)",
+        r"哪个会社|哪部作品|出自|发售时间|最新作品|最新作|最近作品|新作|是不是|是否|制作|开发|的|是|吗|呢|？|\?)",
         " ",
         query,
     )
@@ -474,16 +481,22 @@ class WebTools:
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds, connect=8)
         headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
         sources: list[ResearchSource] = []
+        producers: list[dict] = []
         endpoint_fields = {
             "vn": "id,title,alttitle,released,developers.name",
             "character": "id,name,original,vns.id,vns.title,vns.alttitle,vns.released,vns.developers.name",
             "producer": "id,name,original,type",
         }
         terms = research_terms(query) or (query[:200],)
+        active_endpoint_fields = (
+            {"producer": endpoint_fields["producer"]}
+            if LATEST_WORK_RE.search(query)
+            else endpoint_fields
+        )
         try:
             async with aiohttp.ClientSession(timeout=timeout, trust_env=False, headers=headers) as session:
                 for term in terms[:2]:
-                    for endpoint, fields in endpoint_fields.items():
+                    for endpoint, fields in active_endpoint_fields.items():
                         payload = {
                             "filters": ["search", "=", term],
                             "fields": fields,
@@ -505,6 +518,59 @@ class WebTools:
                             summary = json.dumps(item, ensure_ascii=False, separators=(",", ":"))[:1200]
                             sources.append(
                                 ResearchSource(name, f"https://vndb.org/{identifier}", summary, "vndb-kana")
+                            )
+                            if endpoint == "producer":
+                                producers.append(item)
+                if LATEST_WORK_RE.search(query) and producers:
+                    def normalized(value: object) -> str:
+                        return re.sub(r"[^a-z0-9ぁ-ゖァ-ヺ一-鿿]", "", str(value).casefold())
+
+                    wanted = {normalized(term) for term in terms if normalized(term)}
+                    exact = [
+                        producer
+                        for producer in producers
+                        if normalized(producer.get("name")) in wanted
+                        or normalized(producer.get("original")) in wanted
+                    ]
+                    selected = exact or [producer for producer in producers if producer.get("type") == "co"]
+                    selected = selected[:1] or producers[:1]
+                    for producer in selected:
+                        producer_id = str(producer.get("id") or "")
+                        if not producer_id:
+                            continue
+                        payload = {
+                            "filters": ["developer", "=", ["id", "=", producer_id]],
+                            "fields": "id,title,alttitle,released,developers.name",
+                            "sort": "released",
+                            "reverse": True,
+                            "results": 10,
+                        }
+                        async with session.post(
+                            "https://api.vndb.org/kana/vn", json=payload
+                        ) as response:
+                            if response.status >= 500:
+                                raise WebToolError(f"VNDB 返回 HTTP {response.status}")
+                            if response.status >= 400:
+                                continue
+                            data = await response.json(content_type=None)
+                        latest_results = data.get("results", []) if isinstance(data, dict) else []
+                        for rank, item in enumerate(latest_results, 1):
+                            if not isinstance(item, dict) or not item.get("id"):
+                                continue
+                            identifier = str(item["id"])
+                            name = str(item.get("alttitle") or item.get("title") or identifier)
+                            evidence = {
+                                "release_order": rank,
+                                "as_of": date.today().isoformat(),
+                                **item,
+                            }
+                            sources.append(
+                                ResearchSource(
+                                    name,
+                                    f"https://vndb.org/{identifier}",
+                                    json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))[:1200],
+                                    "vndb-latest",
+                                )
                             )
         except asyncio.TimeoutError as exc:
             raise WebToolError("VNDB 请求超时") from exc
@@ -624,7 +690,27 @@ class WebTools:
                 # SearXNG remains mandatory; a failed VNDB check makes the result insufficient.
                 pass
         clues = vndb_search_clues(vndb_sources)
-        if specialized and clues:
+        latest_source = next(
+            (source for source in vndb_sources if source.provider == "vndb-latest"),
+            None,
+        )
+        if specialized and latest_source is not None:
+            try:
+                latest_record = json.loads(latest_source.summary)
+            except json.JSONDecodeError:
+                latest_record = {}
+            latest_title = str(
+                latest_record.get("alttitle")
+                or latest_record.get("title")
+                or latest_source.title
+            ).strip()
+            yuzu_query = bool(re.search(r"(?:柚子社|ゆずソフト|yuzu[ -]?soft)", value, re.I))
+            search_query = (
+                f'site:yuzu-soft.com "{latest_title}"'
+                if yuzu_query
+                else f'"{latest_title}" official'
+            )
+        elif specialized and clues:
             preferred_title = next(
                 (clue for clue in clues if "*" in clue or "＊" in clue),
                 clues[0],
@@ -643,14 +729,28 @@ class WebTools:
         sources = await self._search_sources(search_query)
         sources.extend(vndb_sources)
         if specialized:
+            evidence_terms: tuple[str, ...] = (*terms, *clues)
+            if latest_source is not None:
+                try:
+                    latest_evidence = json.loads(latest_source.summary)
+                except json.JSONDecodeError:
+                    latest_evidence = {}
+                evidence_terms = (
+                    *terms,
+                    latest_source.title,
+                    str(latest_evidence.get("title") or ""),
+                    str(latest_evidence.get("alttitle") or ""),
+                    "Yuzusoft" if yuzu_query else "",
+                    "ゆずソフト" if yuzu_query else "",
+                )
             folded_terms = tuple(
-                term.casefold() for term in (*terms, *clues) if len(term) >= 3
+                term.casefold() for term in evidence_terms if len(term) >= 3
             )
             if folded_terms:
                 sources = [
                     source
                     for source in sources
-                    if source.provider == "vndb-kana"
+                    if source.provider.startswith("vndb-")
                     or any(
                         term in f"{source.title} {source.summary} {source.url}".casefold()
                         for term in folded_terms
@@ -668,13 +768,16 @@ class WebTools:
             "moegirl.org.cn", "fandom.com",
         )
         unique.sort(
-            key=lambda source: next(
-                (
-                    index
-                    for index, domain in enumerate(priority_domains)
-                    if (urlsplit(source.url).hostname or "").casefold().endswith(domain)
+            key=lambda source: (
+                next(
+                    (
+                        index
+                        for index, domain in enumerate(priority_domains)
+                        if (urlsplit(source.url).hostname or "").casefold().endswith(domain)
+                    ),
+                    len(priority_domains),
                 ),
-                len(priority_domains),
+                0 if source.provider == "vndb-latest" else 1,
             )
         )
         hosts = {
@@ -682,8 +785,14 @@ class WebTools:
             for source in unique
         }
         hosts.discard("")
-        has_vndb = any(source.provider == "vndb-kana" for source in unique)
+        has_vndb = any(source.provider.startswith("vndb-") for source in unique)
         sufficient = len(hosts) >= 2 and (not specialized or has_vndb)
+        if LATEST_WORK_RE.search(value) and re.search(
+            r"(?:柚子社|ゆずソフト|yuzu[ -]?soft)", value, re.I
+        ):
+            has_latest_vndb = any(source.provider == "vndb-latest" for source in unique)
+            has_official = any(host.endswith("yuzu-soft.com") for host in hosts)
+            sufficient = has_latest_vndb and has_official
         return ResearchResult(value, tuple(unique[: self.search_results + 3]), sufficient)
 
     async def get_weather(self, location: str) -> str:

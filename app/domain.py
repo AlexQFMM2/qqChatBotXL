@@ -32,6 +32,9 @@ _QQ_CONTEXT_URL_RE = re.compile(r"URL:(https://[^\s]+)")
 _QQ_CONTEXT_FILENAME_RE = re.compile(r"文件名:([^\s]+)")
 _QQ_CONTEXT_TYPE_RE = re.compile(r"类型:([^\s]+)")
 _QQ_MEDIA_HOSTS = frozenset({"multimedia.nt.qq.com.cn"})
+_QQ_SERIALIZED_ATTACHMENT_BLOCK_RE = re.compile(
+    r"(?ms)^[ \t]*\[附件\d*\].*?(?=\n[ \t]*\n|\n===|\n\[当前消息\]|\n\[消息内容\]|\Z)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +49,7 @@ class ChatLine:
 class AttachmentRef:
     data: dict
     origin: str
+    source_message_id: str = ""
 
 
 def should_reply(
@@ -92,7 +96,11 @@ def message_attachments(message: dict, max_items: int = 20) -> list[AttachmentRe
     """Collect top-level and nested QQ attachments without trusting their paths."""
     collected: list[AttachmentRef] = []
     seen_urls: set[str] = set()
-    def add(attachment: dict, origin: str) -> None:
+    current_author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    current_author_id = str(
+        current_author.get("member_openid") or current_author.get("id") or ""
+    )
+    def add(attachment: dict, origin: str, source_message_id: str = "") -> None:
         if len(collected) >= max_items:
             return
         url = str(attachment.get("url", "")).strip()
@@ -100,7 +108,10 @@ def message_attachments(message: dict, max_items: int = 20) -> list[AttachmentRe
         if dedupe_key in seen_urls:
             return
         seen_urls.add(dedupe_key)
-        collected.append(AttachmentRef(attachment, origin))
+        collected.append(AttachmentRef(attachment, origin, source_message_id))
+
+    def node_message_id(node: dict) -> str:
+        return str(node.get("id") or node.get("message_id") or node.get("msg_id") or "")
 
     def node_origin(node: dict, *, top_level: bool) -> str:
         if top_level:
@@ -110,6 +121,8 @@ def message_attachments(message: dict, max_items: int = 20) -> list[AttachmentRe
             return "bot_context"
         author_id = str(author.get("member_openid") or author.get("id") or "")
         username = str(author.get("username") or "")
+        if author_id and current_author_id and author_id == current_author_id:
+            return "current_user_context"
         if author_id or username:
             return "user_context"
         return "unknown_context"
@@ -118,16 +131,17 @@ def message_attachments(message: dict, max_items: int = 20) -> list[AttachmentRe
         if depth > 4 or len(collected) >= max_items:
             return
         origin = node_origin(node, top_level=top_level)
+        source_message_id = node_message_id(node)
         for attachment in node.get("attachments") or []:
             if not isinstance(attachment, dict):
                 continue
-            add(attachment, origin)
+            add(attachment, origin, source_message_id)
             if len(collected) >= max_items:
                 return
         for attachment in _qq_serialized_attachments(
             str(node.get("content", "")), max_items - len(collected)
         ):
-            add(attachment, origin)
+            add(attachment, origin, source_message_id)
             if len(collected) >= max_items:
                 return
         for element in node.get("msg_elements") or []:
@@ -185,6 +199,14 @@ def _qq_serialized_attachments(content: str, max_items: int) -> list[dict]:
     return recovered
 
 
+def strip_qq_context_media(content: str) -> str:
+    """Remove QQ's textual attachment serialization from model-visible context."""
+    value = _QQ_SERIALIZED_ATTACHMENT_BLOCK_RE.sub("", content)
+    value = _QQ_CONTEXT_URL_RE.sub("", value)
+    lines = [line.rstrip() for line in value.splitlines()]
+    return "\n".join(lines).strip()
+
+
 def message_elements_summary(message: dict, max_items: int = 20) -> str:
     """Render QQ-provided mention/quote context into a bounded text transcript."""
     lines: list[str] = []
@@ -195,14 +217,15 @@ def message_elements_summary(message: dict, max_items: int = 20) -> str:
         for element in elements:
             if len(lines) >= max_items or not isinstance(element, dict):
                 continue
-            content = _QQ_CONTEXT_URL_RE.sub(
-                "URL:[已由系统安全接收]", str(element.get("content", ""))
-            ).strip()
-            attachments = attachment_summary(element)
+            content = strip_qq_context_media(str(element.get("content", "")))
+            author = element.get("author") or {}
+            is_known_user = isinstance(author, dict) and bool(
+                author.get("member_openid") or author.get("id") or author.get("username")
+            ) and not author.get("bot")
+            attachments = attachment_summary(element) if is_known_user else ""
             combined = " ".join(
                 part for part in (content, attachments) if part
             ).strip()
-            author = element.get("author") or {}
             username = (
                 str(author.get("username", "")).strip()
                 if isinstance(author, dict)

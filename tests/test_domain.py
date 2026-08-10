@@ -114,6 +114,22 @@ class FormattingTests(unittest.TestCase):
         )
         self.assertEqual([item.origin for item in value], ["bot_context", "user_context"])
 
+    def test_marks_same_author_nested_media_as_current_user_context(self) -> None:
+        value = message_attachments(
+            {
+                "author": {"member_openid": "current", "username": "小明"},
+                "msg_elements": [
+                    {
+                        "author": {"member_openid": "current", "username": "小明"},
+                        "attachments": [
+                            {"content_type": "image/png", "url": "https://qq.test/current"}
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(value[0].origin, "current_user_context")
+
     def test_recovers_qq_images_serialized_inside_context_text(self) -> None:
         content = (
             "=== 消息 1 ===\n"
@@ -131,7 +147,21 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(value[1].data["content_type"], "image/jpeg")
         summary = message_text({"msg_elements": [{"content": content}]})
         self.assertNotIn("https://", summary)
-        self.assertIn("URL:[已由系统安全接收]", summary)
+        self.assertNotIn("类型:图片", summary)
+
+    def test_serialized_context_media_is_hidden_but_current_question_remains(self) -> None:
+        content = (
+            "[QQ 提供的前文上下文]\n=== 消息 1 ===\n"
+            "[消息内容] 上一条回复\n\n=== 消息 2 ===\n"
+            "[附件1] 类型:图片 文件名:bot.png URL:[已由系统安全接收]\n"
+            "[当前消息]\n柚子社最新作是什么"
+        )
+        from app.domain import strip_qq_context_media
+
+        value = strip_qq_context_media(content)
+        self.assertNotIn("附件1", value)
+        self.assertNotIn("类型:图片", value)
+        self.assertIn("柚子社最新作是什么", value)
 
     def test_rejects_serialized_non_qq_download_url(self) -> None:
         content = (

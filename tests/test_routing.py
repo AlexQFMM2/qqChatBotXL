@@ -47,6 +47,23 @@ class AttachmentRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(values, [])
 
+    async def test_unknown_context_matching_outbound_message_id_is_not_downloaded(self) -> None:
+        await self.bot._store.record_sent_media(
+            "group", "different-hash", "emote", "bot-message-id"
+        )
+        values = await self.bot._save_attachments(
+            [
+                AttachmentRef(
+                    {"url": "https://qq.test/a", "content_type": "image/png"},
+                    "unknown_context",
+                    "bot-message-id",
+                )
+            ],
+            "group",
+            "message",
+        )
+        self.assertEqual(values, [])
+
     async def test_explicit_current_user_upload_is_kept_even_if_hash_matches(self) -> None:
         probe = Path(self.temp.name) / "probe.png"
         probe.write_bytes(b"\x89PNG\r\n\x1a\nrobot-emote")
@@ -88,6 +105,14 @@ class ControllerIntentTests(unittest.TestCase):
             task_intent=TaskIntent.SEARCH,
         )
         self.assertEqual(tools, [])
+
+    def test_latest_work_is_forced_into_research(self) -> None:
+        self.assertEqual(
+            self.bot._task_intent(
+                "柚子社最新作是什么", image_prompt=None, voice_requested=False
+            ),
+            TaskIntent.SEARCH,
+        )
 
 
 if __name__ == "__main__":

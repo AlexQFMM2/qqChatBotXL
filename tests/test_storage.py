@@ -61,6 +61,17 @@ class AttachmentContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.store.is_recent_sent_media("group", "generated-hash"))
         self.assertFalse(await self.store.is_recent_sent_media("other", "generated-hash"))
 
+    async def test_outbound_media_message_id_is_recognized(self) -> None:
+        await self.store.record_sent_media(
+            "group", "emote-hash", "emote", "outbound-message-id"
+        )
+        self.assertTrue(
+            await self.store.is_recent_outbound_message("group", "outbound-message-id")
+        )
+        self.assertFalse(
+            await self.store.is_recent_outbound_message("other", "outbound-message-id")
+        )
+
     async def test_task_run_is_failed_after_restart(self) -> None:
         await self.store.create_task_run("one", "group", "message", "image")
         await self.store.start_task_run("one")

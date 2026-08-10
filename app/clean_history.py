@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .domain import strip_qq_context_media
+
 
 AT_TAG = re.compile(r"<qqbot-at-user\b[^>]*>.*?</qqbot-at-user>|<qqbot-at-user\b[^>]*/?>", re.I | re.S)
 ATTACHMENT_MARKER = re.compile(r"\s*\[附件已保存：([^\]]+)\]")
@@ -20,6 +22,7 @@ class CleanupPreview:
     files: int = 0
     messages: int = 0
     scheduled_messages: int = 0
+    context_media_messages: int = 0
 
 
 def sha256_file(path: Path) -> str:
@@ -43,6 +46,10 @@ def sanitize_history_text(content: str, owner_ids: tuple[str, ...]) -> str:
     for owner_id in sorted(owner_ids, key=len, reverse=True):
         if len(owner_id) >= 6:
             value = value.replace(owner_id, "老师")
+    if "[QQ 提供的前文上下文]" in value and (
+        "[附件" in value or "URL:[已由系统安全接收]" in value
+    ):
+        value = strip_qq_context_media(value)
     return value
 
 
@@ -91,6 +98,13 @@ def run_cleanup(
             if safe != content:
                 sanitized.append((safe, int(message_id)))
         preview.scheduled_messages = len(sanitized)
+        preview.context_media_messages = sum(
+            1
+            for _message_id, content in text_rows
+            if "[QQ 提供的前文上下文]" in str(content)
+            and ("[附件" in str(content) or "URL:[已由系统安全接收]" in str(content))
+            and strip_qq_context_media(str(content)) != str(content)
+        )
 
         if not apply:
             return preview
@@ -150,7 +164,8 @@ def main() -> None:
     mode_label = "apply" if args.apply else "dry-run"
     print(
         f"{mode_label}: attachments={result.attachments} files={result.files} "
-        f"messages={result.messages} sanitized_messages={result.scheduled_messages}"
+        f"messages={result.messages} sanitized_messages={result.scheduled_messages} "
+        f"context_media_messages={result.context_media_messages}"
     )
 
 

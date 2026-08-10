@@ -44,6 +44,14 @@ class CleanHistoryTests(unittest.TestCase):
             )
             db.execute("INSERT INTO chat_messages VALUES(2,'group','bot','夏莉',?,1,2)",
                        ("<qqbot-at-user id='owner-openid'>x</qqbot-at-user>早安",))
+            db.execute(
+                "INSERT INTO chat_messages VALUES(3,'group','u','用户',?,0,3)",
+                (
+                    "[QQ 提供的前文上下文]\n=== 消息 1 ===\n"
+                    "[附件1] 类型:图片 文件名:bot.png URL:[已由系统安全接收]\n"
+                    "[当前消息]\n柚子社最新作是什么",
+                ),
+            )
             db.execute("INSERT INTO chat_attachments VALUES(1,1,'group','inbox/polluted.png','image/png',1)")
             db.execute("INSERT INTO chat_attachments VALUES(2,1,'group','inbox/real.png','image/png',1)")
             db.commit()
@@ -51,6 +59,7 @@ class CleanHistoryTests(unittest.TestCase):
 
             preview = run_cleanup(database, workspace, emotes, owner_ids=("owner-openid",))
             self.assertEqual(preview.attachments, 1)
+            self.assertEqual(preview.context_media_messages, 1)
             self.assertTrue(polluted.exists())
             applied = run_cleanup(
                 database, workspace, emotes, owner_ids=("owner-openid",),
@@ -66,6 +75,8 @@ class CleanHistoryTests(unittest.TestCase):
             self.assertNotIn("polluted.png", contents[0])
             self.assertIn("real.png", contents[0])
             self.assertNotIn("owner-openid", contents[1])
+            self.assertNotIn("类型:图片", contents[2])
+            self.assertIn("柚子社最新作是什么", contents[2])
             self.assertTrue(list(backups.glob("pre-history-cleanup-*.db")))
 
 

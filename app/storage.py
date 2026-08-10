@@ -69,6 +69,7 @@ class MemoryStore:
                 group_id TEXT NOT NULL,
                 sha256 TEXT NOT NULL,
                 media_type TEXT NOT NULL,
+                outbound_message_id TEXT,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sent_media_group_hash
@@ -89,6 +90,15 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_task_runs_status
                 ON task_runs(status, created_at);
             """
+        )
+        sent_media_columns = {
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(sent_media)")
+        }
+        if "outbound_message_id" not in sent_media_columns:
+            self._db.execute("ALTER TABLE sent_media ADD COLUMN outbound_message_id TEXT")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sent_media_message_id "
+            "ON sent_media(group_id, outbound_message_id, created_at DESC)"
         )
         self._db.commit()
         self._lock = asyncio.Lock()
@@ -195,12 +205,17 @@ class MemoryStore:
         return [(str(row[0]), str(row[1])) for row in reversed(rows)]
 
     async def record_sent_media(
-        self, group_id: str, sha256: str, media_type: str
+        self,
+        group_id: str,
+        sha256: str,
+        media_type: str,
+        outbound_message_id: str = "",
     ) -> None:
         async with self._lock:
             self._db.execute(
-                "INSERT INTO sent_media(group_id, sha256, media_type, created_at) VALUES (?, ?, ?, ?)",
-                (group_id, sha256, media_type, int(time.time())),
+                "INSERT INTO sent_media(group_id, sha256, media_type, outbound_message_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (group_id, sha256, media_type, outbound_message_id or None, int(time.time())),
             )
             self._db.commit()
 
@@ -216,6 +231,23 @@ class MemoryStore:
                 LIMIT 1
                 """,
                 (group_id, sha256, cutoff),
+            ).fetchone()
+        return row is not None
+
+    async def is_recent_outbound_message(
+        self, group_id: str, message_id: str, retention_days: int = 30
+    ) -> bool:
+        if not message_id:
+            return False
+        cutoff = int(time.time()) - retention_days * 86400
+        async with self._lock:
+            row = self._db.execute(
+                """
+                SELECT 1 FROM sent_media
+                WHERE group_id IN (?, '') AND outbound_message_id = ? AND created_at >= ?
+                LIMIT 1
+                """,
+                (group_id, message_id, cutoff),
             ).fetchone()
         return row is not None
 

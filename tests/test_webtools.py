@@ -121,6 +121,42 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.sufficient)
         self.assertIn("独立来源是否充足：是", result.as_prompt())
 
+    async def test_latest_yuzusoft_work_uses_vndb_release_order_and_official_search(self) -> None:
+        tools = WebTools(timeout_seconds=1)
+        queries: list[str] = []
+
+        async def fake_vndb(_query: str) -> list[ResearchSource]:
+            return [
+                ResearchSource(
+                    "ライムライト・レモネードジャム",
+                    "https://vndb.org/v56650",
+                    '{"release_order":1,"as_of":"2026-08-10","id":"v56650",'
+                    '"title":"LimeLight Lemonade Jam",'
+                    '"alttitle":"ライムライト・レモネードジャム","released":"2025-09-26"}',
+                    "vndb-latest",
+                )
+            ]
+
+        async def fake_search(query: str) -> list[ResearchSource]:
+            queries.append(query)
+            return [
+                ResearchSource(
+                    "ライムライト・レモネードジャム｜ゆずソフト",
+                    "https://www.yuzu-soft.com/products/lllj/",
+                    "ゆずソフト最新作",
+                    "searxng",
+                )
+            ]
+
+        tools._vndb_sources = fake_vndb  # type: ignore[method-assign]
+        tools._search_sources = fake_search  # type: ignore[method-assign]
+        result = await tools.research("柚子社最新作是什么")
+        self.assertTrue(result.sufficient)
+        self.assertIn("ライムライト", queries[0])
+        prompt = result.as_prompt()
+        self.assertIn("2025-09-26", prompt)
+        self.assertIn("已发售的最新作", prompt)
+
     def test_insufficient_result_forbids_certain_conclusion(self) -> None:
         result = ResearchResult(
             "问题",

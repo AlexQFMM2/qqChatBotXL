@@ -262,13 +262,42 @@ _IMAGE_CONTEXT_TERMS = (
 )
 _FACT_CHECK_TERMS = re.compile(
     r"(?:哪个公司|哪家公司|哪个会社|哪部作品|出自哪|角色是谁|"
-    r"发售时间|发布日期|第几集|是不是|是否是|你确定|查资料|查证|出处|"
+    r"发售时间|发布日期|最新作|最新作品|新作|最近作品|第几集|是不是|是否是|你确定|查资料|查证|出处|"
     r"柚子社|galgame|视觉小说|シャーリィ|沃利克)",
     re.IGNORECASE,
 )
 _CONVERSATION_PREFIX = re.compile(
     r"^(?:(?:可以|好的|好呀|好啊|那就|行|嗯|麻烦|拜托)(?:了|啦|吧|啊|呀)?[，,。.!！\s]*)+"
 )
+
+
+def _qq_context_shapes(message: dict, max_items: int = 20) -> list[dict[str, object]]:
+    """Describe nested QQ context without logging content, URLs, or identifiers."""
+    shapes: list[dict[str, object]] = []
+
+    def visit(elements: object, depth: int) -> None:
+        if depth > 4 or not isinstance(elements, list):
+            return
+        for element in elements:
+            if len(shapes) >= max_items or not isinstance(element, dict):
+                continue
+            author = element.get("author")
+            author_keys = sorted(str(key) for key in author) if isinstance(author, dict) else []
+            shapes.append(
+                {
+                    "depth": depth,
+                    "keys": sorted(str(key) for key in element),
+                    "author_keys": author_keys,
+                    "has_message_id": any(
+                        bool(element.get(key)) for key in ("id", "message_id", "msg_id")
+                    ),
+                    "attachments": len(element.get("attachments") or []),
+                }
+            )
+            visit(element.get("msg_elements"), depth + 1)
+
+    visit(message.get("msg_elements"), 0)
+    return shapes
 
 
 class TaskIntent(str, Enum):
@@ -626,6 +655,7 @@ class PersonaBot:
                 len(data.get("msg_elements") or []),
                 len(raw_attachments),
             )
+            LOGGER.info("QQ 上下文安全结构：%s", _qq_context_shapes(data))
 
         try:
             command_handled, command_reply = await self._command(
@@ -1287,13 +1317,14 @@ class PersonaBot:
                         overlay.detected_regions,
                         overlay.used_fallback,
                     )
-                await self._qq.send_group_file(
+                sent = await self._qq.send_group_file(
                     group_id, target, message_id, sequence=sequence
                 )
                 await self._store.record_sent_media(
                     group_id,
                     await asyncio.to_thread(_sha256_file, target),
                     "generated_image",
+                    str(sent.get("id") or ""),
                 )
                 LOGGER.info(
                     "任务路由：intent=image controller_model=%s helper_model=%s success=true",
@@ -1368,6 +1399,11 @@ class PersonaBot:
         for index, reference in enumerate(attachments):
             if reference.origin in {"bot_context", "user_context"}:
                 LOGGER.info("忽略非当前用户附件，来源=%s", reference.origin)
+                continue
+            if reference.origin != "current_user" and await self._store.is_recent_outbound_message(
+                group_id, reference.source_message_id
+            ):
+                LOGGER.info("忽略与机器人已发消息 ID 一致的上下文附件")
                 continue
             attachment = reference.data
             url = str(attachment.get("url", "")).strip()
@@ -1586,11 +1622,14 @@ class PersonaBot:
         if path.is_symlink() or not path.is_file():
             LOGGER.warning("夏莉表情文件不存在或无效：%s", path)
             return
-        await self._qq.send_group_file(
+        sent = await self._qq.send_group_file(
             group_id, path, message_id, sequence=sequence
         )
         await self._store.record_sent_media(
-            group_id, await asyncio.to_thread(_sha256_file, path), "emote"
+            group_id,
+            await asyncio.to_thread(_sha256_file, path),
+            "emote",
+            str(sent.get("id") or ""),
         )
         await self._store.add(
             group_id,
