@@ -32,19 +32,19 @@ engines:
   - name: bing
     disabled: false
   - name: duckduckgo
-    disabled: false
+    disabled: true
   - name: brave
-    disabled: false
+    disabled: true
   - name: wikipedia
-    disabled: false
+    disabled: true
     language: zh
   - name: wikidata
-    disabled: false
+    disabled: true
   - name: baidu
-    disabled: false
+    disabled: true
   - name: sogou
     disabled: false
   - name: 360search
-    disabled: false
+    disabled: true
   - name: naver
     disabled: false

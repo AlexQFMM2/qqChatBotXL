@@ -161,6 +161,7 @@ class LLMClient:
                 "model": model or self._settings.llm_model,
                 "max_tokens": self._settings.llm_max_tokens,
                 "temperature": self._settings.llm_temperature,
+                "thinking": {"type": "disabled"},
                 "system": system,
                 "messages": messages,
                 "tools": tools,
@@ -194,6 +195,7 @@ class LLMClient:
                     "model": model or self._settings.llm_model,
                     "max_tokens": self._recovery_max_tokens(),
                     "temperature": min(self._settings.llm_temperature, 0.4),
+                    "thinking": {"type": "disabled"},
                     "system": system,
                     "messages": messages,
                 }
@@ -250,6 +252,7 @@ class LLMClient:
             "model": model or self._settings.llm_model,
             "max_tokens": self._settings.llm_max_tokens,
             "temperature": self._settings.llm_temperature,
+            "thinking": {"type": "disabled"},
             "system": system,
             "messages": messages,
         }
@@ -412,6 +415,7 @@ class LLMClient:
             "model": model or self._settings.llm_model,
             "max_tokens": self._settings.llm_max_tokens,
             "temperature": self._settings.llm_temperature,
+            "thinking": {"type": "disabled"},
             "system": system,
             "messages": [
                 {"role": "user", "content": _anthropic_user_content(user_prompt, images)}

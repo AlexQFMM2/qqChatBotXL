@@ -139,6 +139,8 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
         result = await client.complete("system", "user")
 
         self.assertEqual(result, "恢复后的回答")
+        initial_payload = client._post.await_args_list[0].args[2]
+        self.assertEqual(initial_payload["thinking"], {"type": "disabled"})
         recovery_payload = client._post.await_args_list[-1].args[2]
         self.assertEqual(recovery_payload["max_tokens"], 1600)
         self.assertEqual(recovery_payload["temperature"], 0.4)
@@ -173,6 +175,7 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._post.await_count, 3)
         recovery_payload = client._post.await_args_list[-1].args[2]
         self.assertNotIn("tools", recovery_payload)
+        self.assertEqual(recovery_payload["thinking"], {"type": "disabled"})
         self.assertEqual(recovery_payload["max_tokens"], 1600)
         self.assertIn("不要再调用工具", recovery_payload["messages"][-1]["content"][0]["text"])
 
