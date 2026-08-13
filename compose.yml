@@ -27,6 +27,9 @@ services:
     depends_on:
       searxng:
         condition: service_healthy
+    networks:
+      - default
+      - ai-tools
     logging:
       driver: json-file
       options:
@@ -129,3 +132,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  ai-tools:
+    external: true
+    name: ai-tools

@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp import web
 
 from .bot import PersonaBot
+from .bilibili import BilibiliClient
 from .config import Settings
 from .llm import LLMClient
 from .qq import QQClient
@@ -81,7 +82,16 @@ async def run() -> None:
             if settings.web_tools_enabled
             else None
         )
-        bot = PersonaBot(settings, qq, llm, store, web_tools)
+        bilibili = (
+            BilibiliClient(
+                settings.bilibili_base_url,
+                settings.bilibili_token,
+                session,
+            )
+            if settings.bilibili_enabled and settings.bilibili_token
+            else None
+        )
+        bot = PersonaBot(settings, qq, llm, store, web_tools, bilibili)
         good_morning_scheduler = GoodMorningScheduler(settings, qq, store)
         receiver = WebhookReceiver(
             settings.qq_app_id,

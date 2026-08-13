@@ -89,6 +89,13 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_task_runs_status
                 ON task_runs(status, created_at);
+            CREATE TABLE IF NOT EXISTS feature_rate_events (
+                feature TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_feature_rate_events
+                ON feature_rate_events(feature, scope_id, created_at);
             """
         )
         sent_media_columns = {
@@ -343,6 +350,32 @@ class MemoryStore:
                 (group_id, key, value),
             )
             self._db.commit()
+
+    async def claim_feature_rate(
+        self, feature: str, scope_id: str, limit: int, window_seconds: int
+    ) -> bool:
+        now = int(time.time())
+        cutoff = now - window_seconds
+        async with self._lock:
+            self._db.execute(
+                "DELETE FROM feature_rate_events WHERE created_at < ?", (cutoff,)
+            )
+            count = int(
+                self._db.execute(
+                    "SELECT COUNT(*) FROM feature_rate_events "
+                    "WHERE feature = ? AND scope_id = ? AND created_at >= ?",
+                    (feature, scope_id, cutoff),
+                ).fetchone()[0]
+            )
+            if count >= limit:
+                self._db.commit()
+                return False
+            self._db.execute(
+                "INSERT INTO feature_rate_events(feature, scope_id, created_at) VALUES(?,?,?)",
+                (feature, scope_id, now),
+            )
+            self._db.commit()
+            return True
 
     async def cleanup(
         self,

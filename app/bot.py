@@ -13,6 +13,16 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .bilibili import (
+    BilibiliClient,
+    BilibiliError,
+    BilibiliRequest,
+    evidence_prompt,
+    extract_bilibili_links,
+    has_bilibili_read_intent,
+    references_previous_bilibili,
+    requested_sections,
+)
 from .config import Settings
 from .domain import (
     AttachmentRef,
@@ -308,6 +318,7 @@ def _qq_context_shapes(message: dict, max_items: int = 20) -> list[dict[str, obj
 
 class TaskIntent(str, Enum):
     CHAT = "chat"
+    BILIBILI = "bilibili"
     SEARCH = "search"
     IMAGE = "image"
     VOICE = "voice"
@@ -348,12 +359,14 @@ class PersonaBot:
         llm: LLMClient,
         store: MemoryStore,
         web_tools: WebTools | None = None,
+        bilibili: BilibiliClient | None = None,
     ) -> None:
         self._settings = settings
         self._qq = qq
         self._llm = llm
         self._store = store
         self._web_tools = web_tools
+        self._bilibili = bilibili
         self._workspace = GroupWorkspace(
             settings.workspace_root,
             settings.max_workspace_file_mb,
@@ -535,11 +548,60 @@ class PersonaBot:
         role = str(author.get("member_role") or "member")
         command_content = current_message_text(data)
         content = message_text(data)
+        current_bilibili_links = extract_bilibili_links(command_content)
+        context_bilibili_links = extract_bilibili_links(content)
+        bilibili_links = current_bilibili_links
+        bilibili_requested = has_bilibili_read_intent(command_content) and bool(
+            bilibili_links
+        )
+        if (
+            not bilibili_links
+            and references_previous_bilibili(command_content)
+        ):
+            bilibili_links = context_bilibili_links
+            prior = await self._store.history(
+                group_id, self._settings.bilibili_history_messages
+            )
+            if not bilibili_links:
+                for line in reversed(prior):
+                    if line.is_bot:
+                        continue
+                    found = extract_bilibili_links(line.content)
+                    if found:
+                        bilibili_links = found
+                        break
+            bilibili_requested = bool(bilibili_links)
+        if bilibili_requested and len(bilibili_links) > 1:
+            multiple_should_reply = should_reply(
+                event_type,
+                content,
+                self._settings.reply_mode,
+                self._settings.bot_aliases,
+                self._settings.smart_reply_probability,
+            )
+            if multiple_should_reply:
+                choices = "\n".join(
+                    f"{index}. {link}" for index, link in enumerate(bilibili_links, 1)
+                )
+                await self._send(
+                    group_id,
+                    message_id,
+                    "这段上下文里有多个 B 站视频，请指定要读取哪一个：\n" + choices,
+                )
+                return
+        if bilibili_requested and self._bilibili is not None:
+            data = dict(data)
+            data["_qqchat_bilibili_url"] = bilibili_links[0]
+            data["_qqchat_bilibili_include"] = list(
+                requested_sections(command_content)
+            )
         image_prompt = self._explicit_image_prompt(command_content)
         voice_requested = self._explicit_voice_request(command_content)
         task_intent = self._task_intent(
             command_content, image_prompt=image_prompt, voice_requested=voice_requested
         )
+        if data.get("_qqchat_bilibili_url"):
+            task_intent = TaskIntent.BILIBILI
         should_answer = voice_requested or should_reply(
             event_type,
             content,
@@ -551,7 +613,23 @@ class PersonaBot:
 
         if not _from_task_queue:
             eta: str | None = None
-            if task_intent is TaskIntent.IMAGE and (
+            if task_intent is TaskIntent.BILIBILI and should_answer:
+                if not await self._store.claim_feature_rate(
+                    "bilibili",
+                    group_id,
+                    self._settings.bilibili_group_limit,
+                    self._settings.bilibili_group_window_seconds,
+                ):
+                    await self._send(
+                        group_id,
+                        message_id,
+                        "这个群最近读取 B 站视频比较频繁，请过几分钟再试。",
+                    )
+                    return
+                eta = "1～3 分钟"
+            elif task_intent is TaskIntent.BILIBILI:
+                eta = None
+            elif task_intent is TaskIntent.IMAGE and (
                 image_prompt is not None
                 and self._settings.image_generation_enabled
                 and self._agent_allowed(role, user_id)
@@ -734,12 +812,34 @@ class PersonaBot:
         if not should_answer:
             return
 
+        if bilibili_requested and self._bilibili is None:
+            await self._send(
+                group_id,
+                message_id,
+                "B 站视频读取功能当前没有启用，我不能只看链接猜测视频内容。",
+                sequence=progress_sequence,
+            )
+            return
+
         lock = self._group_locks.setdefault(group_id, asyncio.Lock())
         async with lock:
             vision_images: list[ImageInput] = []
+            bilibili_evidence: str | None = None
             next_sequence = progress_sequence
             try:
                 history = await self._store.history(group_id, self._settings.context_messages)
+                bilibili_url = str(data.get("_qqchat_bilibili_url") or "")
+                if bilibili_url:
+                    if self._bilibili is None:
+                        raise BilibiliError("B 站读取功能当前未启用")
+                    include = tuple(
+                        str(item)
+                        for item in (data.get("_qqchat_bilibili_include") or [])
+                    ) or ("metadata", "subtitles")
+                    extracted = await self._bilibili.extract(
+                        BilibiliRequest(bilibili_url, include)
+                    )
+                    bilibili_evidence = evidence_prompt(extracted)
                 persona = Path(self._settings.persona_path).read_text(encoding="utf-8").strip()
                 persona += (
                     "\n\n## 总控规则\n"
@@ -778,6 +878,13 @@ class PersonaBot:
                     self._settings.owner_user_ids,
                     self._settings.owner_title,
                 )
+                if bilibili_evidence:
+                    user_prompt += "\n\n" + bilibili_evidence
+                elif current_bilibili_links:
+                    user_prompt += (
+                        "\n\n[Bilibili 链接状态]\n当前消息含 B 站链接，但用户没有明确要求读取，"
+                        "系统没有访问视频内容。不得假装已经看过；如需总结，应请用户明确提出读取或总结请求。"
+                    )
                 if vision_note:
                     user_prompt += f"\n\n图片输入状态：{vision_note}"
                 if vision_images:
@@ -949,11 +1056,18 @@ class PersonaBot:
                     await self._send_emote(
                         group_id, message_id, emote_name, sequence=next_sequence
                     )
-            except LLMError as exc:
+            except (LLMError, BilibiliError) as exc:
                 LOGGER.exception("处理群消息失败")
                 notified = False
                 try:
-                    if vision_images:
+                    if isinstance(exc, BilibiliError):
+                        await self._send(
+                            group_id,
+                            message_id,
+                            f"这次没有读到 B 站视频：{exc}",
+                            sequence=next_sequence,
+                        )
+                    elif vision_images:
                         await self._send(
                             group_id,
                             message_id,
@@ -1116,6 +1230,8 @@ class PersonaBot:
         role: str,
         task_intent: TaskIntent,
     ) -> list[dict]:
+        if task_intent is TaskIntent.BILIBILI:
+            return []
         tools = (
             list(WEB_TOOLS)
             if self._web_tools is not None and not fact_check_requested

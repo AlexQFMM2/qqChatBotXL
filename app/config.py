@@ -124,6 +124,12 @@ class Settings:
     web_fetch_max_kb: int
     web_fetch_max_chars: int
     web_request_timeout_seconds: float
+    bilibili_enabled: bool
+    bilibili_base_url: str
+    bilibili_token: str
+    bilibili_history_messages: int
+    bilibili_group_limit: int
+    bilibili_group_window_seconds: int
     log_level: str
     log_message_content: bool
     qq_api_base: str = "https://api.bot.qq.com"
@@ -193,10 +199,14 @@ class Settings:
 
         good_morning_enabled = _bool("GOOD_MORNING_ENABLED", False)
         owner_user_ids = frozenset(_csv("OWNER_USER_IDS"))
+        bilibili_enabled = _bool("BILIBILI_ENABLED", False)
+        bilibili_token = os.getenv("BILIBILI_QQCHAT_TOKEN", "").strip()
         if good_morning_enabled and not good_morning_groups:
             raise ValueError("启用早安任务时必须配置 GOOD_MORNING_GROUPS 或 ALLOWED_GROUPS")
         if good_morning_enabled and not owner_user_ids:
             raise ValueError("启用早安任务时必须配置 OWNER_USER_IDS")
+        if bilibili_enabled and not bilibili_token:
+            raise ValueError("启用 Bilibili 读取时必须配置 BILIBILI_QQCHAT_TOKEN")
         return cls(
             qq_app_id=_required("QQ_APP_ID"),
             qq_app_secret=_required("QQ_APP_SECRET"),
@@ -316,6 +326,16 @@ class Settings:
             web_fetch_max_chars=_int("WEB_FETCH_MAX_CHARS", 20000, 1000, 50000),
             web_request_timeout_seconds=_float(
                 "WEB_REQUEST_TIMEOUT_SECONDS", 20, 3, 60
+            ),
+            bilibili_enabled=bilibili_enabled,
+            bilibili_base_url=os.getenv(
+                "BILIBILI_BASE_URL", "http://bilibili-mcp:8080"
+            ).rstrip("/"),
+            bilibili_token=bilibili_token,
+            bilibili_history_messages=_int("BILIBILI_HISTORY_MESSAGES", 20, 1, 100),
+            bilibili_group_limit=_int("BILIBILI_GROUP_LIMIT", 3, 1, 30),
+            bilibili_group_window_seconds=_int(
+                "BILIBILI_GROUP_WINDOW_SECONDS", 300, 60, 3600
             ),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             log_message_content=_bool("LOG_MESSAGE_CONTENT", False),
