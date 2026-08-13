@@ -130,6 +130,8 @@ class Settings:
     bilibili_history_messages: int
     bilibili_group_limit: int
     bilibili_group_window_seconds: int
+    bilibili_media_group_limit: int
+    bilibili_media_group_window_seconds: int
     log_level: str
     log_message_content: bool
     qq_api_base: str = "https://api.bot.qq.com"
@@ -336,6 +338,12 @@ class Settings:
             bilibili_group_limit=_int("BILIBILI_GROUP_LIMIT", 3, 1, 30),
             bilibili_group_window_seconds=_int(
                 "BILIBILI_GROUP_WINDOW_SECONDS", 300, 60, 3600
+            ),
+            bilibili_media_group_limit=_int(
+                "BILIBILI_MEDIA_GROUP_LIMIT", 1, 1, 3
+            ),
+            bilibili_media_group_window_seconds=_int(
+                "BILIBILI_MEDIA_GROUP_WINDOW_SECONDS", 600, 300, 3600
             ),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             log_message_content=_bool("LOG_MESSAGE_CONTENT", False),

@@ -7,9 +7,12 @@ from app.bot import PersonaBot, TaskIntent
 from app.bilibili import (
     evidence_prompt,
     extract_bilibili_links,
+    has_bilibili_media_analysis_intent,
     has_bilibili_read_intent,
     references_previous_bilibili,
     requested_sections,
+    media_evidence_prompt,
+    media_frame_inputs,
 )
 
 
@@ -35,6 +38,29 @@ class BilibiliRoutingTests(unittest.TestCase):
             requested_sections("总结视频和评论区弹幕"),
             ("metadata", "subtitles", "comments", "danmaku"),
         )
+
+    def test_media_analysis_requires_aspect_and_action(self):
+        self.assertTrue(has_bilibili_media_analysis_intent("分析一下这个视频的剪辑和配音质量"))
+        self.assertTrue(has_bilibili_media_analysis_intent("这个成片做得怎么样"))
+        self.assertFalse(has_bilibili_media_analysis_intent("总结这个视频"))
+        self.assertFalse(has_bilibili_media_analysis_intent("我喜欢这个剪辑"))
+
+    def test_media_frames_are_bounded_and_validated(self):
+        import base64
+
+        jpeg = b"\xff\xd8\xffdemo"
+        frames = media_frame_inputs(
+            {"frames": [{"mime_type": "image/jpeg", "data": base64.b64encode(jpeg).decode()}] * 5}
+        )
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(frames[0].data, jpeg)
+
+    def test_media_evidence_forbids_unsupported_voice_claims(self):
+        prompt = media_evidence_prompt(
+            {"editing": {}, "audio": {"available": True}, "warnings": []}, "抽样观察"
+        )
+        self.assertIn("不得评价台词内容", prompt)
+        self.assertIn("无证据客套", prompt)
 
     def test_evidence_is_marked_untrusted(self):
         prompt = evidence_prompt(
