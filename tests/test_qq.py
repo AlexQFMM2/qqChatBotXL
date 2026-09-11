@@ -30,6 +30,10 @@ class FakeSession:
         self.calls.append({"url": url, "headers": headers, "json": json})
         return FakeResponse()
 
+    def get(self, url, *, headers):
+        self.calls.append({"url": url, "headers": headers})
+        return FakeResponse()
+
 
 class FileBlockTests(unittest.TestCase):
     def test_reads_blocks_by_byte_offset(self) -> None:
@@ -61,6 +65,13 @@ class GroupTextTests(unittest.IsolatedAsyncioTestCase):
         await self.client.send_group_text("group", "早安")
         payload = self.session.calls[-1]["json"]
         self.assertEqual(payload, {"msg_type": 0, "content": "早安"})
+
+    async def test_get_me_uses_authenticated_official_endpoint(self) -> None:
+        result = await self.client.get_me()
+        self.assertEqual(result["id"], "sent")
+        self.assertEqual(
+            self.session.calls[-1]["url"], "https://api.example.test/users/@me"
+        )
 
     async def test_reply_message_keeps_message_id_and_sequence(self) -> None:
         await self.client.send_group_text("group", "回复", "message", sequence=3)

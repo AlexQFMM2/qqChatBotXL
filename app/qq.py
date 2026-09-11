@@ -66,6 +66,19 @@ class QQClient:
             "content-type": "application/json",
         }
 
+    async def get_me(self) -> dict:
+        """Return the authenticated bot user used to match full-mode mentions."""
+        url = f"{self.settings.qq_api_base}/users/@me"
+        async with self.session.get(url, headers=await self.auth_headers()) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400 or not isinstance(data, dict):
+                raise QQAPIError(
+                    f"获取机器人身份失败：HTTP {response.status} {str(data)[:400]}"
+                )
+            if not str(data.get("id") or data.get("user_openid") or "").strip():
+                raise QQAPIError("获取机器人身份失败：响应中没有机器人 ID")
+            return data
+
     def sanitize_text(self, content: str) -> str:
         protected = {
             str(getattr(self.settings, "qq_app_id", "")),

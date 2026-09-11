@@ -30,6 +30,7 @@ from .config import Settings
 from .domain import (
     AttachmentRef,
     EMOTE_NAMES,
+    bot_mention_id,
     build_user_prompt,
     clean_reply,
     current_message_text,
@@ -37,6 +38,7 @@ from .domain import (
     message_attachments,
     message_text,
     should_reply,
+    strip_bot_mention,
 )
 from .llm import ImageInput, LLMClient, LLMError, VisionInputError
 from .image_text import ImageTextError, apply_text_overlays, plan_image_text
@@ -387,6 +389,9 @@ class PersonaBot:
         )
         self._task_workers: list[asyncio.Task] = []
         self._task_outstanding = 0
+        self._bot_user_id = ""
+        self._bot_username = ""
+        self._bot_group_mention_ids: dict[str, str] = {}
 
     @property
     def task_queue_size(self) -> int:
@@ -399,6 +404,15 @@ class PersonaBot:
     async def start(self) -> None:
         if self._task_workers:
             return
+        try:
+            identity = await self._qq.get_me()
+            self._bot_user_id = str(
+                identity.get("id") or identity.get("user_openid") or ""
+            ).strip()
+            self._bot_username = str(identity.get("username") or "").strip()
+            LOGGER.info("已获取机器人身份，全量群消息可准确识别 @机器人")
+        except Exception:
+            LOGGER.exception("获取机器人身份失败，将仅依赖事件中的 bot mention 标记")
         await self._seed_builtin_media()
         stale = await self._store.fail_stale_tasks()
         for task_id, group_id, _message_id in stale:
@@ -549,8 +563,39 @@ class PersonaBot:
         username = str(author.get("username") or "群成员")
         user_id = str(author.get("member_openid") or author.get("id") or "unknown")
         role = str(author.get("member_role") or "member")
-        command_content = current_message_text(data)
-        content = message_text(data)
+        expected_mention_id = self._bot_group_mention_ids.get(
+            group_id, self._bot_user_id
+        )
+        mention_id = bot_mention_id(
+            data, expected_mention_id, self._bot_username
+        )
+        if mention_id:
+            self._bot_group_mention_ids[group_id] = mention_id
+        mentions = [
+            mention
+            for mention in (data.get("mentions") or [])
+            if isinstance(mention, dict)
+        ]
+        if mentions:
+            LOGGER.info(
+                "QQ @判定：mentions=%s、bot_mentions=%s、identity_name_matches=%s、addressed=%s",
+                len(mentions),
+                sum(mention.get("bot") is True for mention in mentions),
+                sum(
+                    bool(self._bot_username)
+                    and str(mention.get("username") or "").strip().casefold()
+                    == self._bot_username.casefold()
+                    for mention in mentions
+                ),
+                mention_id is not None,
+            )
+        normalized_data = dict(data)
+        normalized_data["content"] = strip_bot_mention(
+            str(data.get("content", "")), mention_id
+        )
+        command_content = current_message_text(normalized_data)
+        content = message_text(normalized_data)
+        bot_mentioned = event_type == "GROUP_AT_MESSAGE_CREATE" or mention_id is not None
         current_bilibili_links = extract_bilibili_links(command_content)
         context_bilibili_links = extract_bilibili_links(content)
         bilibili_links = current_bilibili_links
@@ -585,6 +630,7 @@ class PersonaBot:
                 self._settings.reply_mode,
                 self._settings.bot_aliases,
                 self._settings.smart_reply_probability,
+                mentioned=bot_mentioned,
             )
             if multiple_should_reply:
                 choices = "\n".join(
@@ -617,6 +663,7 @@ class PersonaBot:
             self._settings.reply_mode,
             self._settings.bot_aliases,
             self._settings.smart_reply_probability,
+            mentioned=bot_mentioned,
         )
         progress_sequence = _progress_sequence
 

@@ -40,6 +40,7 @@ _MODEL_IMAGE_MARKER_RE = re.compile(
     r"\[附件已保存：[^\]]+\.(?:jpe?g|png|gif|webp)\])",
     re.IGNORECASE,
 )
+_MENTION_RE = re.compile(r"<@!?([^>]+)>")
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +65,10 @@ def should_reply(
     aliases: Iterable[str],
     probability: float,
     random_value: Callable[[], float] = random.random,
+    *,
+    mentioned: bool = False,
 ) -> bool:
-    if event_type == "GROUP_AT_MESSAGE_CREATE":
+    if event_type == "GROUP_AT_MESSAGE_CREATE" or mentioned:
         return True
     if mode == "mention":
         return False
@@ -78,6 +81,65 @@ def should_reply(
     if content.lstrip().startswith(("/", "问", "请问")):
         return True
     return random_value() < probability
+
+
+def bot_mention_id(
+    message: dict,
+    bot_user_id: str = "",
+    bot_username: str = "",
+) -> str | None:
+    """Return the marker ID for this bot in a full group event.
+
+    QQ uses a group-scoped ID inside group mention markers, which can differ from
+    the OpenID returned by ``/users/@me``.  The authenticated username bridges
+    those scopes without accepting mentions of other users or other bots.
+    """
+    expected = bot_user_id.strip()
+    expected_username = bot_username.strip().casefold()
+    marker_ids = _MENTION_RE.findall(str(message.get("content", "")))
+    for mention in message.get("mentions") or []:
+        if not isinstance(mention, dict):
+            continue
+        mention_ids = [
+            value
+            for value in (
+                str(mention.get("id") or "").strip(),
+                str(mention.get("user_openid") or "").strip(),
+                str(mention.get("member_openid") or "").strip(),
+                str(mention.get("union_openid") or "").strip(),
+            )
+            if value
+        ]
+        if not mention_ids:
+            continue
+        direct_match = bool(expected and expected in mention_ids)
+        username_match = bool(
+            expected_username
+            and mention.get("bot") is True
+            and str(mention.get("username") or "").strip().casefold()
+            == expected_username
+        )
+        unscoped_bot_fallback = bool(
+            not expected and not expected_username and mention.get("bot") is True
+        )
+        if direct_match or username_match or unscoped_bot_fallback:
+            return next(
+                (mention_id for mention_id in mention_ids if mention_id in marker_ids),
+                mention_ids[0],
+            )
+
+    if expected:
+        if expected in marker_ids:
+            return expected
+    return None
+
+
+def strip_bot_mention(content: str, mention_id: str | None) -> str:
+    """Remove only the authenticated bot's mention and preserve mentions of other users."""
+    if not mention_id:
+        return content
+    pattern = re.compile(rf"<@!?{re.escape(mention_id)}>")
+    return pattern.sub("", content).strip()
 
 
 def attachment_summary(message: dict) -> str:

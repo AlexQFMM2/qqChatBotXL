@@ -4,6 +4,7 @@ import unittest
 
 from app.domain import (
     ChatLine,
+    bot_mention_id,
     build_user_prompt,
     clean_reply,
     current_message_text,
@@ -11,6 +12,7 @@ from app.domain import (
     message_attachments,
     message_text,
     should_reply,
+    strip_bot_mention,
 )
 
 
@@ -23,6 +25,18 @@ class ShouldReplyTests(unittest.TestCase):
     def test_mention_mode_ignores_plain_group_message(self) -> None:
         self.assertFalse(
             should_reply("GROUP_MESSAGE_CREATE", "大家好", "mention", ("小Q",), 1)
+        )
+
+    def test_full_mode_replies_when_bot_is_explicitly_mentioned(self) -> None:
+        self.assertTrue(
+            should_reply(
+                "GROUP_MESSAGE_CREATE",
+                "读取表格",
+                "mention",
+                ("小Q",),
+                0,
+                mentioned=True,
+            )
         )
 
     def test_smart_mode_replies_to_alias(self) -> None:
@@ -39,6 +53,71 @@ class ShouldReplyTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    def test_matches_bot_mention_in_full_group_event(self) -> None:
+        message = {
+            "content": "<@bot-openid> 读取刚才的表格",
+            "mentions": [{"id": "bot-openid", "bot": True}],
+        }
+        mention_id = bot_mention_id(message, "bot-openid")
+        self.assertEqual(mention_id, "bot-openid")
+        self.assertEqual(
+            strip_bot_mention(message["content"], mention_id), "读取刚才的表格"
+        )
+
+    def test_cached_bot_id_matches_content_when_mentions_are_missing(self) -> None:
+        message = {"content": "<@bot-openid> 现在能看到吗"}
+        self.assertEqual(bot_mention_id(message, "bot-openid"), "bot-openid")
+
+    def test_maps_group_scoped_marker_by_authenticated_bot_username(self) -> None:
+        message = {
+            "content": "<@group-scoped-bot-id> 读取刚才的表格",
+            "mentions": [
+                {
+                    "id": "group-scoped-bot-id",
+                    "username": "夏莉",
+                    "bot": True,
+                }
+            ],
+        }
+        mention_id = bot_mention_id(message, "global-bot-id", "夏莉")
+        self.assertEqual(mention_id, "group-scoped-bot-id")
+        self.assertEqual(strip_bot_mention(message["content"], mention_id), "读取刚才的表格")
+
+    def test_matches_secondary_mention_identity_and_returns_content_marker(self) -> None:
+        message = {
+            "content": "<@group-scoped-bot-id> 读表",
+            "mentions": [
+                {
+                    "id": "group-scoped-bot-id",
+                    "user_openid": "global-bot-id",
+                    "bot": True,
+                }
+            ],
+        }
+        self.assertEqual(
+            bot_mention_id(message, "global-bot-id"), "group-scoped-bot-id"
+        )
+
+    def test_other_user_mention_is_not_treated_as_bot_mention(self) -> None:
+        message = {
+            "content": "<@other-user> 你怎么看",
+            "mentions": [{"id": "other-user", "bot": False}],
+        }
+        self.assertIsNone(bot_mention_id(message, "bot-openid"))
+        self.assertEqual(
+            strip_bot_mention(message["content"], "bot-openid"), message["content"]
+        )
+
+    def test_other_bot_mention_is_not_treated_as_authenticated_bot(self) -> None:
+        message = {
+            "content": "<@other-bot> 你怎么看",
+            "mentions": [{"id": "other-bot", "bot": True}],
+        }
+        self.assertIsNone(bot_mention_id(message, "bot-openid", "夏莉"))
+
+    def test_full_group_message_without_mentions_is_not_addressed(self) -> None:
+        self.assertIsNone(bot_mention_id({"content": "大家好"}, "bot-openid"))
+
     def test_message_text_adds_attachment_summary(self) -> None:
         value = message_text(
             {
