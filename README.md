@@ -48,8 +48,8 @@ QQ_APP_ID=...
 QQ_APP_SECRET=...
 LLM_BASE_URL=https://qqchat.example.com
 LLM_API_KEY=...
-LLM_MODEL=deepseek-v4-flash
-MODEL_CATALOG_JSON={"flash":"deepseek-v4-flash","pro":"deepseek-v4-pro[1m]"}
+LLM_MODEL=Fusion/qqchatbot
+MODEL_CATALOG_JSON={"main":"Fusion/qqchatbot"}
 BOT_NAME=夏莉
 BOT_ALIASES=夏莉,夏莉·沃利克,Shirley,シャーリィ,小Q
 OWNER_USER_IDS=
@@ -63,6 +63,7 @@ IMAGE_EDIT_ENABLED=true
 IMAGE_EDIT_MODEL=qwen-image-edit-max
 IMAGE_EDIT_MAX_IMAGES=3
 VISION_ENABLED=true
+VISION_ROUTE=fusion
 VISION_MODEL=qwen3.7-flash
 VISION_API_FORMAT=openai
 VISION_CONTEXT_MESSAGES=20
@@ -78,11 +79,13 @@ WEB_SEARCH_RESULTS=8
 
 不要把 `.env` 提交到 Git。建议为机器人单独创建一个带请求数和 Token 限额的中转站 Key。
 
+`Fusion/qqchatbot` 是 CCR 中供机器人长期使用的逻辑模型。需要更换实际总控模型时，只修改 CCR 后台该 Fusion 的“基础模型”，不需要再修改或重建 QQChat。
+
 `OWNER_USER_IDS` 用 QQ 回调中的 `member_openid` 绑定开发者/老师身份，不依赖可伪造的群昵称。绑定后，模型会在最近聊天记录中看到经过验证的专属关系标注；人格仍保留安全和隐私边界。
 
 维护默认值：单群工作区 500 MiB、全部群合计 5 GiB、单文件 50 MiB；收到的附件保留 14 天，机器人生成的文件保留 90 天，残留下载分片保留 24 小时；聊天记录保留 30 天且每群最多 1000 条，Webhook 去重记录保留 7 天。SQLite 每 24 小时在线备份一次并保留 7 天，Docker 日志最多保留约 30 MiB。启动时会立即维护，此后每 6 小时执行。管理员可在群内发送 `/cleanup` 手动执行，`/status` 可查看本群容量。
 
-识图支持 JPEG、PNG、GIF 和 WebP。只有当前消息实际带图，或文字明确提到“这张图/刚才的图/截图”等时才启用视觉助手；无关资料问答不会被历史图片切到千问。千问只输出中性画面观察和 OCR，观察结果再交给 DeepSeek 结合上下文与工具生成最终回复。机器人发出的表情与生成图片会记录哈希，QQ 回传缺少作者时也不会误存成用户附件。
+识图支持 JPEG、PNG、GIF 和 WebP。只有当前消息实际带图，或文字明确提到“这张图/刚才的图/截图”等时才启用视觉助手；无关资料问答不会携带历史图片。推荐使用 `VISION_ROUTE=fusion`，将选中的图片交给 `Fusion/qqchatbot` 在 CCR 中配置的 `vision_understand` 工具；视觉模型在 CCR 后台切换，无需修改或重启 QQChat。迁移期间可改回 `VISION_ROUTE=direct`，由 `VISION_MODEL` 直接生成中性画面观察和 OCR。机器人发出的表情与生成图片会记录哈希，QQ 回传缺少作者时也不会误存成用户附件。Bilibili 成片联系表暂时仍使用 `VISION_MODEL`，将在普通图片链路稳定后另行迁移。
 
 参考图生图使用独立的百炼原生适配容器。普通“画一张图”仍调用 `IMAGE_GENERATION_MODEL`；说“以你自己为原型/画夏莉”时会从 `IMAGE_CHARACTER_REFERENCES` 选择内置 CG，说“参考刚才的图/修改图片”时会读取最近聊天图片并调用 `IMAGE_EDIT_MODEL`。适配端点复用机器人的中转站 Bearer Key，对外只开放精确路径 `/v1/image-edits`，百炼上游 Key 仅存在于 `.image-adapter.env`，不会进入机器人容器。
 

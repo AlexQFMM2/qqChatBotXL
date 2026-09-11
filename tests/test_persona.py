@@ -70,6 +70,7 @@ class PersonaSettingsTests(unittest.TestCase):
         self.assertTrue(settings.emote_enabled)
         self.assertEqual(settings.emote_path, "/app/emotes")
         self.assertTrue(settings.vision_enabled)
+        self.assertEqual(settings.vision_route, "direct")
         self.assertIsNone(settings.vision_model)
         self.assertIsNone(settings.vision_api_format)
         self.assertEqual(settings.vision_context_messages, 20)
@@ -83,6 +84,19 @@ class PersonaSettingsTests(unittest.TestCase):
         self.assertEqual(settings.chat_max_messages_per_group, 1000)
         self.assertEqual(settings.database_backup_interval_hours, 24)
         self.assertEqual(settings.database_backup_retention_days, 7)
+
+    def test_rejects_invalid_vision_route(self) -> None:
+        required = {
+            "QQ_APP_ID": "test-app",
+            "QQ_APP_SECRET": "test-secret",
+            "LLM_BASE_URL": "https://example.test",
+            "LLM_API_KEY": "test-key",
+            "LLM_MODEL": "test-model",
+            "VISION_ROUTE": "automatic",
+        }
+        with patch.dict(os.environ, required, clear=True):
+            with self.assertRaisesRegex(ValueError, "VISION_ROUTE"):
+                Settings.from_env()
 
     def test_emote_assets_are_complete_png_files(self) -> None:
         expected = {

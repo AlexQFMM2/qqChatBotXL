@@ -121,6 +121,30 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", final_payload)
         self.assertIn("工具调用轮次已达到上限", final_payload["messages"][-1]["content"][-1]["text"])
 
+    async def test_tool_loop_forwards_images_in_initial_user_message(self) -> None:
+        from app.llm import LLMClient
+
+        client = LLMClient(self._settings(), None)
+        client._post = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "看到了"}]}
+        )
+        image = ImageInput("image/png", b"\x89PNG\r\n\x1a\nimage")
+
+        result = await client.complete_with_tools(
+            "system",
+            "看图",
+            [{"name": "work", "input_schema": {"type": "object"}}],
+            AsyncMock(return_value="unused"),
+            model="Fusion/qqchatbot",
+            images=[image],
+        )
+
+        self.assertEqual(result, "看到了")
+        payload = client._post.await_args.args[2]
+        self.assertEqual(payload["model"], "Fusion/qqchatbot")
+        self.assertEqual(payload["messages"][0]["content"][0]["type"], "image")
+        self.assertEqual(payload["messages"][0]["content"][-1]["text"], "看图")
+
     async def test_plain_anthropic_empty_response_retries_with_larger_budget(self) -> None:
         from app.llm import LLMClient
 

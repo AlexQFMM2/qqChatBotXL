@@ -81,6 +81,7 @@ class Settings:
     voice_max_chars: int
     voice_max_mb: int
     vision_enabled: bool
+    vision_route: str
     vision_model: str | None
     vision_api_format: str | None
     vision_context_messages: int
@@ -146,6 +147,10 @@ class Settings:
         raw_vision_api_format = os.getenv("VISION_API_FORMAT", "").strip().lower()
         if raw_vision_api_format not in {"", "anthropic", "openai"}:
             raise ValueError("VISION_API_FORMAT 只能留空、anthropic 或 openai")
+
+        vision_route = os.getenv("VISION_ROUTE", "direct").strip().lower()
+        if vision_route not in {"direct", "fusion"}:
+            raise ValueError("VISION_ROUTE 只能是 direct 或 fusion")
 
         reply_mode = os.getenv("REPLY_MODE", "mention").strip().lower()
         if reply_mode not in {"mention", "smart", "all"}:
@@ -254,6 +259,7 @@ class Settings:
             voice_max_chars=_int("VOICE_MAX_CHARS", 240, 20, 1000),
             voice_max_mb=_int("VOICE_MAX_MB", 8, 1, 20),
             vision_enabled=_bool("VISION_ENABLED", True),
+            vision_route=vision_route,
             vision_model=os.getenv("VISION_MODEL", "").strip() or None,
             vision_api_format=raw_vision_api_format or None,
             vision_context_messages=_int("VISION_CONTEXT_MESSAGES", 20, 1, 100),
