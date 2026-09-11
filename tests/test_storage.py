@@ -30,6 +30,37 @@ class AttachmentContextTests(unittest.IsolatedAsyncioTestCase):
         result = await self.store.recent_image_attachments("group", 20, 4)
         self.assertEqual(result, [("inbox/picture.png", "image/png")])
 
+    async def test_recent_images_only_come_from_latest_image_message(self) -> None:
+        await self.store.add(
+            "group",
+            "user",
+            "小明",
+            "[图片]",
+            attachments=(("inbox/old.png", "image/png"),),
+        )
+        await self.store.add("group", "user", "小明", "中间的文字消息")
+        await self.store.add(
+            "group",
+            "user",
+            "小明",
+            "[图片] [图片]",
+            attachments=(
+                ("inbox/new-1.png", "image/png"),
+                ("inbox/new-2.jpg", "image/jpeg"),
+            ),
+        )
+        await self.store.add("group", "user", "小明", "看看刚才的截图")
+
+        result = await self.store.recent_image_attachments("group", 20, 4)
+
+        self.assertEqual(
+            result,
+            [
+                ("inbox/new-1.png", "image/png"),
+                ("inbox/new-2.jpg", "image/jpeg"),
+            ],
+        )
+
     async def test_image_falls_outside_message_window(self) -> None:
         await self.store.add(
             "group",

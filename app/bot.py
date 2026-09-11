@@ -952,6 +952,23 @@ class PersonaBot:
                 user_prompt, controller_images = await self._route_vision(
                     user_prompt, vision_images
                 )
+                if (
+                    controller_images
+                    and self._settings.vision_route == "fusion"
+                    and self._settings.task_progress_ack_enabled
+                    and not _from_task_queue
+                ):
+                    try:
+                        await self._qq.send_group_text(
+                            group_id,
+                            "收到，正在读取你提到的图片；这一步可能需要几分钟，完成后我会直接回复。",
+                            message_id,
+                            sequence=next_sequence,
+                        )
+                        LOGGER.info("已向群 %s 发送识图处理中回执", group_id)
+                        next_sequence += 1
+                    except QQAPIError:
+                        LOGGER.exception("发送识图处理中回执失败，继续执行识图")
                 if media_payload is not None:
                     media_observation: str | None = None
                     frame_inputs = media_frame_inputs(media_payload)
@@ -1690,8 +1707,8 @@ class PersonaBot:
         notes: list[str] = []
         if images:
             notes.append(
-                f"已按聊天时间顺序提供最近 {self._settings.vision_context_messages} 条消息中的 "
-                f"{len(images)} 张图片，请结合文字记录判断所指图片并根据真实画面回答。"
+                f"已按聊天时间顺序提供最近一条含图片消息中的 {len(images)} 张图片，"
+                "请结合文字记录判断所指图片并根据真实画面回答。"
             )
         if skipped:
             notes.append(f"有 {len(skipped)} 张图片因格式或大小限制未提供给模型。")

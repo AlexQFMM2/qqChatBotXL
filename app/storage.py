@@ -189,11 +189,32 @@ class MemoryStore:
                 FROM chat_attachments AS attachment
                 JOIN chat_messages AS message ON message.id = attachment.chat_message_id
                 WHERE message.group_id = ?
-                  AND message.id IN (
-                      SELECT id FROM chat_messages
-                      WHERE group_id = ?
-                      ORDER BY id DESC
-                      LIMIT ?
+                  AND message.id = (
+                      SELECT candidate.id
+                      FROM (
+                          SELECT id
+                          FROM chat_messages
+                          WHERE group_id = ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      ) AS candidate
+                      WHERE EXISTS (
+                          SELECT 1
+                          FROM chat_attachments AS recent_attachment
+                          WHERE recent_attachment.group_id = ?
+                            AND recent_attachment.chat_message_id = candidate.id
+                            AND (
+                                lower(recent_attachment.content_type) = 'image'
+                                OR lower(recent_attachment.content_type) LIKE 'image/%'
+                                OR lower(recent_attachment.relative_path) LIKE '%.jpg'
+                                OR lower(recent_attachment.relative_path) LIKE '%.jpeg'
+                                OR lower(recent_attachment.relative_path) LIKE '%.png'
+                                OR lower(recent_attachment.relative_path) LIKE '%.gif'
+                                OR lower(recent_attachment.relative_path) LIKE '%.webp'
+                            )
+                      )
+                      ORDER BY candidate.id DESC
+                      LIMIT 1
                   )
                   AND (
                       lower(attachment.content_type) = 'image'
@@ -207,7 +228,7 @@ class MemoryStore:
                 ORDER BY message.id DESC, attachment.id DESC
                 LIMIT ?
                 """,
-                (group_id, group_id, message_limit, image_limit),
+                (group_id, group_id, message_limit, group_id, image_limit),
             ).fetchall()
         return [(str(row[0]), str(row[1])) for row in reversed(rows)]
 
