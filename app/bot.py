@@ -1662,7 +1662,7 @@ class PersonaBot:
         """
         if not images:
             LOGGER.info(
-                "消息路由：vision_used=false vision_route=%s controller_model=%s",
+                "消息路由：vision_used=false vision_route=%s images=0 controller_model=%s",
                 self._settings.vision_route,
                 self._settings.llm_model,
             )
@@ -1698,7 +1698,8 @@ class PersonaBot:
             api_format=self._settings.vision_api_format,
         )
         LOGGER.info(
-            "消息路由：vision_used=true vision_route=direct helper_model=%s controller_model=%s",
+            "消息路由：vision_used=true vision_route=direct images=%s helper_model=%s controller_model=%s",
+            len(images),
             self._settings.vision_model,
             self._settings.llm_model,
         )
