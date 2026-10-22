@@ -8,7 +8,7 @@ import re
 import tempfile
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -26,6 +26,8 @@ from .bilibili import (
     references_previous_bilibili,
     requested_sections,
 )
+from .channel import IncomingMessage, QQTransport, Transport, TransportError
+from .memory.transport import MemoryTransport
 from .config import Settings
 from .domain import (
     AttachmentRef,
@@ -42,7 +44,7 @@ from .domain import (
 )
 from .llm import ImageInput, LLMClient, LLMError, VisionInputError
 from .image_text import ImageTextError, apply_text_overlays, plan_image_text
-from .qq import QQAPIError, QQClient
+from .qq import QQClient
 from .storage import MemoryStore
 from .webtools import WebTools, WebToolError
 from .workspace import GroupWorkspace, WorkspaceError
@@ -72,7 +74,10 @@ WORKSPACE_TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "读取本群工作区中的 UTF-8 文本文件。",
+        "description": (
+            "读取本群工作区中的 UTF-8 文本或 .xlsx 工作簿。Excel 会返回工作表名、"
+            "行号、列号和制表符分隔的单元格内容；刚上传的文件不会自动读取。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -273,6 +278,7 @@ _CHAT_REFERENCE_TERMS = (
 
 _IMAGE_CONTEXT_TERMS = (
     "这张图", "这张图片", "这个图片", "这幅图", "刚才的图", "刚才的图片",
+    "那张图", "那幅图", "那个图片", "这张照片", "那张照片", "刚才的照片",
     "刚发的图", "刚发的图片", "上面的图", "上一张", "前一张", "图里", "图中",
     "图上", "图片里", "图片中", "图片上", "图片内容", "截图", "看看图", "看图",
     "识图", "识别图片", "分析图片", "读图",
@@ -354,6 +360,7 @@ class QueuedTask:
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     progress_sequence: int = 1
     ready: asyncio.Event = field(default_factory=asyncio.Event)
+    message: IncomingMessage | None = None
 
 
 class PersonaBot:
@@ -365,9 +372,14 @@ class PersonaBot:
         store: MemoryStore,
         web_tools: WebTools | None = None,
         bilibili: BilibiliClient | None = None,
+        *,
+        transport: Transport | None = None,
+        memory=None,
     ) -> None:
         self._settings = settings
         self._qq = qq
+        self._channel_transport = transport
+        self._memory = memory
         self._llm = llm
         self._store = store
         self._web_tools = web_tools
@@ -394,6 +406,12 @@ class PersonaBot:
         self._bot_group_mention_ids: dict[str, str] = {}
 
     @property
+    def transport(self) -> Transport:
+        transport = getattr(self, "_channel_transport", None) or QQTransport(self._qq)
+        memory = getattr(self, '_memory', None)
+        return MemoryTransport(transport, memory) if memory else transport
+
+    @property
     def task_queue_size(self) -> int:
         return self._task_outstanding
 
@@ -417,7 +435,7 @@ class PersonaBot:
         stale = await self._store.fail_stale_tasks()
         for task_id, group_id, _message_id in stale:
             try:
-                await self._qq.send_group_text(
+                await self.transport.send_text(
                     group_id,
                     "上次服务重启前有一项任务没有完成，已经按失败结束；如果还需要，请重新发一次。",
                 )
@@ -427,7 +445,7 @@ class PersonaBot:
                     terminal_sent=True,
                     error="service restarted",
                 )
-            except QQAPIError:
+            except TransportError:
                 LOGGER.exception("通知遗留任务失败状态时出错")
         self._task_workers = [
             asyncio.create_task(
@@ -471,14 +489,18 @@ class PersonaBot:
             try:
                 await task.ready.wait()
                 await self._store.start_task_run(task.task_id)
-                await self.on_event(
-                    task.event_type,
-                    task.data,
-                    _from_task_queue=True,
-                    _progress_sequence=task.progress_sequence,
-                    _task_id=task.task_id,
-                    _task_intent=task.intent,
-                )
+                if task.message is not None:
+                    await self.handle_message(
+                        task.message, _from_task_queue=True,
+                        _progress_sequence=task.progress_sequence,
+                        _task_id=task.task_id, _task_intent=task.intent,
+                    )
+                else:
+                    await self.on_event(
+                        task.event_type, task.data, _from_task_queue=True,
+                        _progress_sequence=task.progress_sequence,
+                        _task_id=task.task_id, _task_intent=task.intent,
+                    )
                 await self._store.finish_task_run(
                     task.task_id, succeeded=True, terminal_sent=True
                 )
@@ -496,7 +518,7 @@ class PersonaBot:
                             sequence=task.progress_sequence,
                         )
                         notified = True
-                    except QQAPIError:
+                    except TransportError:
                         LOGGER.exception("后台任务失败后无法发送通知")
                 await self._store.finish_task_run(
                     task.task_id,
@@ -515,7 +537,7 @@ class PersonaBot:
                         sequence=task.progress_sequence,
                     )
                     notified = True
-                except QQAPIError:
+                except TransportError:
                     LOGGER.exception("后台任务失败后仍无法发送通知")
                 await self._store.finish_task_run(
                     task.task_id,
@@ -596,6 +618,40 @@ class PersonaBot:
         command_content = current_message_text(normalized_data)
         content = message_text(normalized_data)
         bot_mentioned = event_type == "GROUP_AT_MESSAGE_CREATE" or mention_id is not None
+        message = IncomingMessage(
+            channel="qq", conversation_id=group_id, message_id=message_id,
+            user_id=user_id, username=username, role=role,
+            content=content, command_content=command_content,
+            should_answer=should_reply(
+                event_type, content, self._settings.reply_mode,
+                self._settings.bot_aliases, self._settings.smart_reply_probability,
+                mentioned=bot_mentioned,
+            ),
+            attachments=tuple(message_attachments(data)),
+        )
+        LOGGER.info("QQ 上下文安全结构：%s", _qq_context_shapes(data))
+        await self.handle_message(
+            message, _from_task_queue=_from_task_queue,
+            _progress_sequence=_progress_sequence, _task_id=_task_id,
+            _task_intent=_task_intent,
+        )
+
+    async def handle_message(self, message: IncomingMessage, **kwargs) -> None:
+        memory = getattr(self, '_memory', None)
+        if memory is None:
+            return await self._handle_message(message, **kwargs)
+        with memory.turn(message):
+            return await self._handle_message(message, **kwargs)
+
+    async def _handle_message(
+        self, message: IncomingMessage, *, _from_task_queue: bool = False,
+        _progress_sequence: int = 1, _task_id: str | None = None,
+        _task_intent: TaskIntent = TaskIntent.CHAT,
+    ) -> None:
+        """Authorized, normalized input; each channel owns admission and deduplication."""
+        group_id, message_id = message.conversation_id, message.message_id
+        user_id, username, role = message.user_id, message.username, message.role
+        content, command_content = message.content, message.command_content
         current_bilibili_links = extract_bilibili_links(command_content)
         context_bilibili_links = extract_bilibili_links(content)
         bilibili_links = current_bilibili_links
@@ -624,14 +680,7 @@ class PersonaBot:
                         break
             bilibili_requested = bool(bilibili_links)
         if bilibili_requested and len(bilibili_links) > 1:
-            multiple_should_reply = should_reply(
-                event_type,
-                content,
-                self._settings.reply_mode,
-                self._settings.bot_aliases,
-                self._settings.smart_reply_probability,
-                mentioned=bot_mentioned,
-            )
+            multiple_should_reply = message.should_answer
             if multiple_should_reply:
                 choices = "\n".join(
                     f"{index}. {link}" for index, link in enumerate(bilibili_links, 1)
@@ -643,34 +692,25 @@ class PersonaBot:
                 )
                 return
         if bilibili_requested and self._bilibili is not None:
-            data = dict(data)
-            data["_qqchat_bilibili_url"] = bilibili_links[0]
-            data["_qqchat_bilibili_include"] = list(
-                requested_sections(command_content)
+            message = replace(
+                message, bilibili_url=bilibili_links[0],
+                bilibili_include=tuple(requested_sections(command_content)),
+                bilibili_media=media_analysis_requested,
             )
-            if media_analysis_requested:
-                data["_qqchat_bilibili_media"] = True
         image_prompt = self._explicit_image_prompt(command_content)
         voice_requested = self._explicit_voice_request(command_content)
         task_intent = self._task_intent(
             command_content, image_prompt=image_prompt, voice_requested=voice_requested
         )
-        if data.get("_qqchat_bilibili_url"):
+        if message.bilibili_url:
             task_intent = TaskIntent.BILIBILI
-        should_answer = voice_requested or should_reply(
-            event_type,
-            content,
-            self._settings.reply_mode,
-            self._settings.bot_aliases,
-            self._settings.smart_reply_probability,
-            mentioned=bot_mentioned,
-        )
+        should_answer = voice_requested or message.should_answer
         progress_sequence = _progress_sequence
 
         if not _from_task_queue:
             eta: str | None = None
             if task_intent is TaskIntent.BILIBILI and should_answer:
-                heavy = bool(data.get("_qqchat_bilibili_media"))
+                heavy = bool(message.bilibili_media)
                 allowed = await self._store.claim_feature_rate(
                     "bilibili-media" if heavy else "bilibili",
                     group_id,
@@ -709,8 +749,9 @@ class PersonaBot:
                 eta = _task_eta(command_content)
             if eta is not None:
                 task = QueuedTask(
-                    event_type=event_type,
-                    data=dict(data),
+                    event_type="",
+                    data={},
+                    message=message,
                     group_id=group_id,
                     message_id=message_id,
                     intent=task_intent,
@@ -752,20 +793,22 @@ class PersonaBot:
                         f"预计约 {estimate}；完成后无论成功还是失败，我都会再告诉你。"
                     )
                     try:
-                        await self._qq.send_group_text(
+                        await self.transport.send_text(
                             group_id, acknowledgement, message_id
                         )
                         LOGGER.info("已向群 %s 发送任务入队回执", group_id)
                         task.progress_sequence = 2
-                    except QQAPIError:
+                    except TransportError:
                         LOGGER.exception("发送任务入队回执失败，继续执行任务")
                 task.ready.set()
                 return
 
-        raw_attachments = message_attachments(data)
+        raw_attachments = message.attachments
         saved_attachments = await self._save_attachments(
             raw_attachments, group_id, message_id
         )
+        if message.channel == "wechat" and len(saved_attachments) < len(raw_attachments):
+            content += " [部分附件保存失败，未提供给模型；请明确说明，不能猜测内容。]"
         if saved_attachments:
             content += " " + " ".join(
                 f"[附件已保存：{attachment.relative_path}]"
@@ -789,16 +832,10 @@ class PersonaBot:
                 "收到群 %s 的消息，发送者：%s，事件：%s，附件数：%s",
                 group_id,
                 username,
-                event_type,
+                message.channel,
                 len(raw_attachments),
             )
-            LOGGER.info(
-                "QQ 消息结构：顶层附件 %s、上下文元素 %s、含嵌套后附件 %s",
-                len(data.get("attachments") or []),
-                len(data.get("msg_elements") or []),
-                len(raw_attachments),
-            )
-            LOGGER.info("QQ 上下文安全结构：%s", _qq_context_shapes(data))
+
 
         try:
             command_handled, command_reply = await self._command(
@@ -817,7 +854,7 @@ class PersonaBot:
                         sequence=progress_sequence,
                     )
                 return
-        except (WorkspaceError, QQAPIError) as exc:
+        except (WorkspaceError, TransportError) as exc:
             LOGGER.warning("执行群命令失败：%s", exc)
             notified = False
             try:
@@ -888,19 +925,19 @@ class PersonaBot:
             next_sequence = progress_sequence
             try:
                 history = await self._store.history(group_id, self._settings.context_messages)
-                bilibili_url = str(data.get("_qqchat_bilibili_url") or "")
+                bilibili_url = str(message.bilibili_url or "")
                 if bilibili_url:
                     if self._bilibili is None:
                         raise BilibiliError("B 站读取功能当前未启用")
                     include = tuple(
                         str(item)
-                        for item in (data.get("_qqchat_bilibili_include") or [])
+                        for item in (message.bilibili_include or [])
                     ) or ("metadata", "subtitles")
                     extracted = await self._bilibili.extract(
                         BilibiliRequest(bilibili_url, include)
                     )
                     bilibili_evidence = evidence_prompt(extracted)
-                    if data.get("_qqchat_bilibili_media"):
+                    if message.bilibili_media:
                         media_payload = await self._bilibili.analyze_media(bilibili_url)
                 persona = Path(self._settings.persona_path).read_text(encoding="utf-8").strip()
                 persona += (
@@ -911,6 +948,18 @@ class PersonaBot:
                     "不得声称任务已经入队、正在画、稍后发送或已经完成；这些状态只能由系统回执。"
                     "外部事实资料不足或相互冲突时必须明确说无法确认，不得按人设补全。"
                 )
+                if message.channel == "wechat":
+                    persona += (
+                        "\n\n## 当前渠道与能力（优先于人格中 QQ 场景描述）\n"
+                        "当前是微信一对一私聊，对方是经扫码绑定的老师，无需 @。"
+                        "复用同一人格、模型、工作区和工具；上下文属于本次私聊。"
+                        "跨端长期记忆只以本轮提供的授权资料为准，不得虚构其他群的回忆。"
+                        "图片和文件由渠道保存到本会话工作区，实际读取、生成与发送以工具结果为准。"
+                        "只介绍本次实际启用的能力，不要声称具有未启用的工具。"
+                        "微信暂不支持原生语音、主动早安或 B 站成片分析。"
+                        f"联网={self._web_tools is not None}；识图={self._settings.vision_enabled}；"
+                        f"生图={self._settings.image_generation_enabled}；表情={self._settings.emote_enabled}。"
+                    )
                 web_calls = 0
                 current_image_attachments = [
                     item
@@ -918,7 +967,9 @@ class PersonaBot:
                     if item.content_type.startswith("image")
                     or item.path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
                 ]
-                references_image = _references_image(command_content)
+                references_image = _references_image(command_content) or (
+                    message.channel == "wechat" and bool(current_image_attachments)
+                )
                 vision_candidates: list[SavedAttachment] = []
                 vision_note: str | None = None
                 if references_image:
@@ -939,7 +990,16 @@ class PersonaBot:
                     self._settings.bot_name,
                     self._settings.owner_user_ids,
                     self._settings.owner_title,
+                    channel=message.channel,
                 )
+                memory = getattr(self, '_memory', None)
+                if memory:
+                    user_prompt += memory.prompt(command_content)
+                    persona += ('\n长期记忆由后台提取；只有 /memory 命令的成功结果能确认已写入。'
+                                '不要仅凭意愿回复“已经记住”。使用旧事实时留意来源时间和冲突。'
+                                '本轮提供的已授权长期记忆已经过身份和权限核验，可以直接用来延续跨端对话。'
+                                '相关事实已提供时，应据此回答，不要以看不到其他渠道聊天为由要求用户重发。'
+                                '资料未涵盖的内容仍不可猜测；长期事实不代表能查看其他渠道的全部聊天。')
                 if bilibili_evidence:
                     user_prompt += "\n\n" + bilibili_evidence
                 elif current_bilibili_links:
@@ -959,7 +1019,7 @@ class PersonaBot:
                     and not _from_task_queue
                 ):
                     try:
-                        await self._qq.send_group_text(
+                        await self.transport.send_text(
                             group_id,
                             "收到，正在读取你提到的图片；这一步可能需要几分钟，完成后我会直接回复。",
                             message_id,
@@ -967,7 +1027,7 @@ class PersonaBot:
                         )
                         LOGGER.info("已向群 %s 发送识图处理中回执", group_id)
                         next_sequence += 1
-                    except QQAPIError:
+                    except TransportError:
                         LOGGER.exception("发送识图处理中回执失败，继续执行识图")
                 if media_payload is not None:
                     media_observation: str | None = None
@@ -1019,8 +1079,13 @@ class PersonaBot:
                         f"控制在 {self._settings.voice_max_chars} 个汉字以内；不要使用 Markdown、"
                         "网址、表格、表情标记或舞台动作说明。"
                     )
-                async def execute_tool(name: str, arguments: dict) -> str:
+                async def execute_tool_inner(name: str, arguments: dict) -> str:
                     nonlocal next_sequence, web_calls
+                    if memory and not memory.valid():
+                        raise WorkspaceError('使用的长期记忆已失效，停止本轮工具操作。')
+                    if (getattr(self.transport, "uncertain", False)
+                            or getattr(self.transport, "expired", False)):
+                        raise WorkspaceError("渠道发送状态尚未确认，已停止本条消息后续工具操作。")
                     if name in {"research", "web_search", "fetch_url", "get_weather"}:
                         if self._web_tools is None:
                             raise WebToolError("联网工具当前未启用")
@@ -1045,26 +1110,37 @@ class PersonaBot:
                             str(arguments.get("location", ""))
                         )
                     if name == "list_files":
-                        files = self._workspace.list_files(
+                        files = self._memory_list_files(
                             group_id, str(arguments.get("path", "."))
                         )
                         return "工作区为空" if not files else "\n".join(files)
                     if name == "read_file":
-                        return self._workspace.read_text(group_id, str(arguments.get("path", "")))
+                        self._check_memory_file(group_id, str(arguments.get('path', '')))
+                        return await asyncio.to_thread(
+                            self._workspace.read_text,
+                            group_id,
+                            str(arguments.get("path", "")),
+                        )
                     if name == "write_file":
+                        self._prepare_memory_file(group_id, str(arguments.get('path', '')))
                         path = self._workspace.write_text(
                             group_id,
                             str(arguments.get("path", "")),
                             str(arguments.get("content", "")),
                         )
+                        if memory:
+                            memory.file_refs(group_id, path, write=True)
                         return f"已写入 {path.name}，{path.stat().st_size} 字节"
                     if name == "create_pdf":
+                        self._prepare_memory_file(group_id, str(arguments.get('path', '')))
                         path = self._workspace.write_pdf(
                             group_id,
                             str(arguments.get("path", "")),
                             str(arguments.get("title", "")),
                             str(arguments.get("content", "")),
                         )
+                        if memory:
+                            memory.file_refs(group_id, path, write=True)
                         return f"已生成 PDF：{path.name}，{path.stat().st_size} 字节"
                     if name == "send_file":
                         if next_sequence > 4:
@@ -1072,12 +1148,18 @@ class PersonaBot:
                         path = self._workspace.file_for_send(
                             group_id, str(arguments.get("path", ""))
                         )
-                        await self._qq.send_group_file(
+                        await self.transport.send_file(
                             group_id, path, message_id, sequence=next_sequence
                         )
                         next_sequence += 1
                         return f"已把 {path.name} 发送到群里"
                     raise WorkspaceError(f"不支持的工具：{name}")
+
+                async def execute_tool(name: str, arguments: dict) -> str:
+                    result = await execute_tool_inner(name, arguments)
+                    if memory and not memory.valid():
+                        raise WorkspaceError('工具完成期间记忆已失效，结果已撤下。')
+                    return result
 
                 # Forced factual research has already produced an evidence bundle.
                 # Do not expose search tools again: repeated searches made some
@@ -1104,6 +1186,8 @@ class PersonaBot:
                         images=controller_images,
                     )
                 raw_reply, emote_name = extract_emote(raw, EMOTE_NAMES)
+                if memory and not memory.valid():
+                    raw_reply, emote_name = memory.safe_reply(raw_reply), None
                 reply = clean_reply(
                     raw_reply,
                     self._settings.max_reply_chars,
@@ -1121,7 +1205,7 @@ class PersonaBot:
                                 voice_text,
                                 sequence=next_sequence,
                             )
-                        except (LLMError, QQAPIError, OSError):
+                        except (LLMError, TransportError, OSError):
                             LOGGER.exception("语音生成或发送失败，回退文字")
                             await self._send(
                                 group_id, message_id, reply, sequence=next_sequence
@@ -1161,11 +1245,11 @@ class PersonaBot:
                             sequence=next_sequence,
                         )
                     notified = True
-                except QQAPIError:
+                except TransportError:
                     LOGGER.exception("发送任务失败提示时出错")
                 if _from_task_queue:
                     raise TaskExecutionError(str(exc), notified=notified) from exc
-            except QQAPIError as exc:
+            except TransportError as exc:
                 LOGGER.exception("处理群消息失败")
                 if _from_task_queue:
                     raise TaskExecutionError(str(exc), notified=False) from exc
@@ -1180,7 +1264,7 @@ class PersonaBot:
                         sequence=next_sequence,
                     )
                     notified = True
-                except QQAPIError:
+                except TransportError:
                     LOGGER.exception("发送未预期任务失败提示时出错")
                 if _from_task_queue:
                     raise TaskExecutionError(str(exc), notified=notified) from exc
@@ -1196,6 +1280,32 @@ class PersonaBot:
     ) -> tuple[bool, str | None]:
         raw = content.strip()
         command = raw.casefold()
+        memory = getattr(self, '_memory', None)
+        if command == '/memory' or command.startswith('/memory '):
+            return True, memory.command(raw) if memory else '长期记忆未启用。'
+        if group_id.startswith("wechat:"):
+            if command in {"/help", "/帮助"}:
+                return True, (
+                    "直接说想聊什么或做什么就好，不用 @。图片和文件会放进本次私聊工作区。"
+                    "可以用 /files 查看、/read 路径 读取文本或 Excel、/send 路径 回传。"
+                    "也可让我生成文本或 PDF；联网、识图和生图以实际启用能力为准。"
+                    "附件目前限 5 MiB。/status 查看状态，/reset 清空本次聊天上下文。"
+                )
+            if command in {"/status", "/状态"}:
+                return True, (
+                    f"微信私聊已接入{self._settings.bot_name}；上下文窗口 {self._settings.context_messages} 条。"
+                    "图片 / 文件收发已接入共用工作区工具（≤5 MiB）。"
+                    f"联网：{'已启用' if self._web_tools else '未启用'}；"
+                    f"识图：{'已启用' if self._settings.vision_enabled else '未启用'}；"
+                    + (memory.status_text() if memory else '长期记忆未启用。')
+                )
+            if command in {"/reset", "/清空记忆"}:
+                if role not in ADMIN_ROLES:
+                    return True, "只有绑定者可以清空本次聊天。"
+                await self._store.reset_group(group_id)
+                return True, "本次私聊的对话上下文已清空；工作区文件保留。"
+            if command in {"/persona", "/人格"}:
+                return True, "我是夏莉·沃利克，老师。这里也能直接找我聊天、处理文件了。"
         if command in {"/help", "/帮助"}:
             return True, (
                 "不用记一大串咒语，直接 @我说想做什么就好。我能陪大家聊天，也会联网搜索、"
@@ -1226,6 +1336,7 @@ class PersonaBot:
                 f"夏莉表情：{'已启用' if self._settings.emote_enabled else '未启用'}；"
                 f"本群工作区：{group_usage_mb:.1f}/{self._settings.workspace_quota_mb} MiB；"
                 f"自动清理：每 {self._settings.maintenance_interval_minutes} 分钟。"
+                + (memory.status_text() if memory else '')
             )
         if command in {"/persona", "/人格"}:
             return True, (
@@ -1275,13 +1386,16 @@ class PersonaBot:
             if not self._agent_allowed(role):
                 return True, "工作区命令目前只允许群主或管理员使用。"
             relative = raw[6:].strip() or "."
-            files = self._workspace.list_files(group_id, relative)
+            files = self._memory_list_files(group_id, relative)
             return True, "工作区为空。" if not files else "工作区：\n" + "\n".join(files)
         if command.startswith("/read "):
             if not self._agent_allowed(role):
                 return True, "工作区命令目前只允许群主或管理员使用。"
             relative = raw[6:].strip()
-            value = self._workspace.read_text(group_id, relative)
+            self._check_memory_file(group_id, relative)
+            value = await asyncio.to_thread(
+                self._workspace.read_text, group_id, relative
+            )
             return True, value[: self._settings.max_reply_chars]
         if command.startswith("/write "):
             if not self._agent_allowed(role):
@@ -1290,19 +1404,50 @@ class PersonaBot:
             if " " not in arguments and "\n" not in arguments:
                 return True, "用法：/write 文件名 内容"
             path, value = arguments.split(maxsplit=1)
+            self._prepare_memory_file(group_id, path)
             written = self._workspace.write_text(group_id, path, value)
+            if memory:
+                memory.file_refs(group_id, written, write=True)
             return True, f"已写入：{written.name}（{written.stat().st_size} 字节）。"
         if command.startswith("/send "):
             if not self._agent_allowed(role):
                 return True, "发送工作区文件目前只允许群主或管理员使用。"
             relative = raw[6:].strip()
             path = self._workspace.file_for_send(group_id, relative)
-            await self._qq.send_group_file(
+            await self.transport.send_file(
                 group_id, path, message_id, sequence=sequence
             )
             LOGGER.info("已向群 %s 发送工作区文件 %s", group_id, path.name)
             return True, None
         return False, None
+
+    def _check_memory_file(self, group_id, relative):
+        memory = getattr(self, '_memory', None)
+        if memory:
+            path = self._workspace.file_for_send(group_id, relative)
+            if not memory.file_refs(group_id, path):
+                raise WorkspaceError('这个文件引用的长期记忆已失效，请重新生成。')
+
+    def _prepare_memory_file(self, group_id, relative):
+        memory = getattr(self, '_memory', None)
+        if memory:
+            path = self._workspace.resolve(group_id, relative, must_exist=False)
+            memory.file_refs(group_id, path, write=True)
+
+    def _memory_list_files(self, group_id, relative):
+        files = self._workspace.list_files(group_id, relative)
+        memory = getattr(self, '_memory', None)
+        if not memory:
+            return files
+        visible = []
+        for entry in files:
+            name = re.sub(r' \(\d+ B\)$', '', entry)
+            if name.endswith('/') or entry == '…列表已截断':
+                continue
+            path = self._workspace.file_for_send(group_id, name)
+            if memory.file_refs(group_id, path):
+                visible.append(entry)
+        return visible
 
     def _agent_allowed(self, role: str, user_id: str | None = None) -> bool:
         return (
@@ -1519,7 +1664,7 @@ class PersonaBot:
                 )
                 if maximum <= 0:
                     raise WorkspaceError("本群工作区配额已用完")
-                await self._qq.download_attachment(image_url, target, maximum)
+                await self.transport.download_attachment(image_url, target, maximum)
                 if text_plan.texts:
                     overlay = apply_text_overlays(
                         target,
@@ -1535,7 +1680,7 @@ class PersonaBot:
                         overlay.detected_regions,
                         overlay.used_fallback,
                     )
-                sent = await self._qq.send_group_file(
+                sent = await self.transport.send_file(
                     group_id, target, message_id, sequence=sequence
                 )
                 await self._store.record_sent_media(
@@ -1549,7 +1694,7 @@ class PersonaBot:
                     self._settings.llm_model,
                     self._settings.image_edit_model if reference_images else self._settings.image_generation_model,
                 )
-            except (ImageTextError, LLMError, QQAPIError, WorkspaceError) as exc:
+            except (ImageTextError, LLMError, TransportError, WorkspaceError) as exc:
                 LOGGER.warning("生成或发送图片失败：%s", exc)
                 LOGGER.info(
                     "任务路由：intent=image controller_model=%s success=false",
@@ -1577,7 +1722,7 @@ class PersonaBot:
                     "画好了，老师看看合不合心意。",
                     sequence=sequence + 1,
                 )
-            except QQAPIError:
+            except TransportError:
                 LOGGER.exception("生成图片已发送，但补充文字发送失败")
             return target.relative_to(self._workspace.group_root(group_id)).as_posix()
 
@@ -1644,8 +1789,8 @@ class PersonaBot:
             try:
                 remaining = self._workspace.remaining_bytes(group_id)
                 if remaining <= 0:
-                    raise QQAPIError("本群工作区总配额已用完")
-                await self._qq.download_attachment(
+                    raise TransportError("本群工作区总配额已用完")
+                await self.transport.download_attachment(
                     url, target, min(self._workspace.max_file_bytes, remaining)
                 )
                 digest = await asyncio.to_thread(_sha256_file, target)
@@ -1662,7 +1807,7 @@ class PersonaBot:
                         content_type=content_type,
                     )
                 )
-            except QQAPIError:
+            except TransportError:
                 LOGGER.exception("保存 QQ 附件失败：%s", filename)
         return saved
 
@@ -1838,8 +1983,11 @@ class PersonaBot:
         *,
         sequence: int = 1,
     ) -> None:
+        memory = getattr(self, '_memory', None)
+        if memory:
+            reply = memory.safe_reply(reply)
         reply = self._redact_internal_reply(reply)
-        await self._qq.send_group_text(group_id, reply, message_id, sequence=sequence)
+        await self.transport.send_text(group_id, reply, message_id, sequence=sequence)
         await self._store.add(
             group_id, "bot", self._settings.bot_name, reply, is_bot=True
         )
@@ -1868,7 +2016,7 @@ class PersonaBot:
         path = Path(filename)
         try:
             await asyncio.to_thread(path.write_bytes, audio)
-            await self._qq.send_group_file(
+            await self.transport.send_file(
                 group_id, path, message_id, sequence=sequence
             )
         finally:
@@ -1898,7 +2046,7 @@ class PersonaBot:
         if path.is_symlink() or not path.is_file():
             LOGGER.warning("夏莉表情文件不存在或无效：%s", path)
             return
-        sent = await self._qq.send_group_file(
+        sent = await self.transport.send_file(
             group_id, path, message_id, sequence=sequence
         )
         await self._store.record_sent_media(

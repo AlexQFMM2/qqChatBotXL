@@ -1,19 +1,25 @@
 services:
   qqchat-bot:
+    image: ${QQCHAT_IMAGE:-qqchat-local:dev}
     build:
-      context: .
+      context: ${QQCHAT_BUILD_CONTEXT:-.}
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-mirror.ccs.tencentyun.com/library/python:3.12-slim}
     container_name: qqchat-bot
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      MEMORY_DIR: ${MEMORY_DIR:-}
+      MEMORY_IDENTITIES: /app/identity/identities.json
     ports:
       - "127.0.0.1:18080:8080"
     volumes:
       - ./data:/app/data
       - ./workspace:/workspace
-      - ./persona.md:/app/persona.md:ro
+      - ${QQCHAT_PERSONA:-./persona.md}:/app/persona.md:ro
+      - ./shared-memory:/app/shared-memory
+      - ./memory-identity:/app/identity:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -37,6 +43,47 @@ services:
         max-file: "3"
     # 容器端口只绑定环回地址，公网仅能通过 Nginx 的精确 Webhook 路径访问。
     # 不挂载宿主机目录、SSH 凭证或 Docker Socket，Agent 只能看到专用工作区。
+
+  wxchat-bot:
+    profiles: [wechat]
+    image: ${QQCHAT_IMAGE:-qqchat-local:dev}
+    container_name: wxchat-bot
+    command: [python, -m, app.wechat.chat, --state-dir, /app/data]
+    restart: unless-stopped
+    stop_grace_period: 210s
+    env_file:
+      - path: .wechat-server.env
+        format: raw
+    environment:
+      MEMORY_DIR: /app/shared-memory
+      MEMORY_IDENTITIES: /app/identity/identities.json
+      MEMORY_MAINTAINER: 'true'
+      TASK_QUEUE_WORKERS: '1'
+    volumes:
+      - ./wechat-data:/app/data
+      - ./shared-memory:/app/shared-memory
+      - ./memory-identity:/app/identity:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    mem_limit: 512m
+    pids_limit: 100
+    init: true
+    networks: [default, ai-tools]
+    healthcheck:
+      test: [CMD, python, -m, app.wechat.health]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
 
   searxng:
     image: ${SEARXNG_IMAGE:-searxng/searxng:latest}

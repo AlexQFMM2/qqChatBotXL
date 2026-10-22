@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from .channel import TransportError
 from .config import Settings
 
 LOGGER = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ _COMMON_SECRET = re.compile(
     r"(?i)(?:bearer\s+|sk-|api[_-]?key\s*[:=]\s*)[A-Za-z0-9._-]{8,}"
 )
 
-class QQAPIError(RuntimeError):
+class QQAPIError(TransportError):
     pass
 
 

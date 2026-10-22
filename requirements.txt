@@ -1,3 +1,4 @@
 aiohttp==3.12.15
 cryptography==45.0.6
 Pillow==11.3.0
+openpyxl==3.1.5

@@ -10,6 +10,10 @@ from app.storage import MemoryStore
 
 
 class AttachmentContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claim_rejects_duplicate_message_id(self) -> None:
+        self.assertTrue(await self.store.claim("same-message"))
+        self.assertFalse(await self.store.claim("same-message"))
+
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = MemoryStore(str(Path(self.temp.name) / "memory.db"))

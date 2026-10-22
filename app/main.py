@@ -12,6 +12,7 @@ from .bot import PersonaBot
 from .bilibili import BilibiliClient
 from .config import Settings
 from .llm import LLMClient
+from .memory.service import MemoryService
 from .qq import QQClient
 from .scheduler import GoodMorningScheduler
 from .storage import MemoryStore
@@ -53,6 +54,7 @@ async def _health(request: web.Request) -> web.Response:
             "rejected_requests": receiver.rejected_requests,
             "last_event_at": receiver.last_event_at,
             "good_morning": scheduler.status(),
+            "memory": bot._memory.status() if bot._memory else {'enabled': False},
             "time": time.time(),
         }
     )
@@ -91,7 +93,10 @@ async def run() -> None:
             if settings.bilibili_enabled and settings.bilibili_token
             else None
         )
-        bot = PersonaBot(settings, qq, llm, store, web_tools, bilibili)
+        memory = MemoryService.from_env(settings.qq_app_id, store, llm, channel='qq')
+        bot = PersonaBot(settings, qq, llm, store, web_tools, bilibili, memory=memory)
+        if memory:
+            memory.start()
         good_morning_scheduler = GoodMorningScheduler(settings, qq, store)
         receiver = WebhookReceiver(
             settings.qq_app_id,
@@ -142,6 +147,8 @@ async def run() -> None:
             await receiver.close()
             await bot.close()
             await runner.cleanup()
+            if memory:
+                await memory.close()
             store.close()
             logger.info("qqchat-bot 已停止")
 

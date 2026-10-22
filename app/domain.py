@@ -334,6 +334,8 @@ def build_user_prompt(
     bot_name: str = "小Q",
     owner_user_ids: Iterable[str] = (),
     owner_title: str = "老师",
+    *,
+    channel: str = "qq",
 ) -> str:
     owners = frozenset(owner_user_ids)
     line_list = list(lines)
@@ -345,7 +347,8 @@ def build_user_prompt(
         if line.is_bot:
             speaker = f"{bot_name}（你）"
         elif line.user_id and line.user_id in owners:
-            speaker = f"{owner_title}（你唯一绑定的开发者，OpenID 已验证）"
+            verification = "扫码身份已验证" if channel == "wechat" else "OpenID 已验证"
+            speaker = f"{owner_title}（你唯一绑定的开发者，{verification}）"
         else:
             speaker = line.username
         transcript.append(f"{speaker}: {visible_content}")
@@ -360,9 +363,15 @@ def build_user_prompt(
             f"禁止用他的群昵称称呼他，只能称“{owner_title}”或自然省略称呼。"
             "普通任务交流不必机械重复。"
         )
-    return (
+    scene = (
+        "下面是本次微信私聊最近的聊天记录。最后一条是当前消息；请结合说话人和上下文，"
+        "直接给出私聊回复，不要添加姓名前缀或解释。\n\n"
+        if channel == "wechat" else
         "下面是这个群最近的聊天记录。最后一条是当前消息；请结合说话人和上下文，"
         "直接给出你要发到群里的回复，不要添加姓名前缀或解释。\n\n"
+    )
+    return (
+        scene
         + "\n".join(transcript)
         + relationship_note
     )

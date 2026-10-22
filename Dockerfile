@@ -6,11 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
 RUN addgroup --gid 1000 bot \
     && adduser --disabled-password --gecos "" --uid 1000 --gid 1000 --home /app bot
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-wechat.txt ./
+RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} -r requirements-wechat.txt
 
 COPY app ./app
 COPY persona.md ./persona.md

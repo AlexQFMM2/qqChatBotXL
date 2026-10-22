@@ -3,14 +3,48 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+import zipfile
 from dataclasses import dataclass
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path, PurePosixPath
+
+from openpyxl import load_workbook
 
 from .pdfgen import create_text_pdf
 
 
+XLSX_MAX_SHEETS = 20
+XLSX_MAX_ROWS_PER_SHEET = 500
+XLSX_MAX_COLUMNS_PER_SHEET = 100
+XLSX_MAX_CELLS = 20_000
+XLSX_MAX_ARCHIVE_ENTRIES = 10_000
+XLSX_MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+
+
 class WorkspaceError(ValueError):
     pass
+
+
+def _excel_column_name(index: int) -> str:
+    value = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        value = chr(65 + remainder) + value
+    return value
+
+
+def _excel_cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        result = value.isoformat(sep=" ")
+    elif isinstance(value, (date, datetime_time)):
+        result = value.isoformat()
+    elif isinstance(value, bool):
+        result = "TRUE" if value else "FALSE"
+    else:
+        result = str(value)
+    return result.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +110,11 @@ class GroupWorkspace:
             raise WorkspaceError("指定路径不是文件")
         if path.stat().st_size > self.max_file_bytes:
             raise WorkspaceError("文件超过工作区读取限制")
+        suffix = path.suffix.casefold()
+        if suffix == ".xls":
+            raise WorkspaceError("暂不支持旧版 .xls，请另存为 .xlsx 后再读取")
+        if suffix == ".xlsx":
+            return self._read_xlsx(path)
         try:
             value = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
@@ -83,6 +122,72 @@ class GroupWorkspace:
         if len(value) > self.max_text_chars:
             raise WorkspaceError("文本过长，请缩小文件或用 /send 直接发送")
         return value
+
+    def _read_xlsx(self, path: Path) -> str:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                entries = archive.infolist()
+                if len(entries) > XLSX_MAX_ARCHIVE_ENTRIES:
+                    raise WorkspaceError("Excel 文件内部条目过多，拒绝读取")
+                if sum(entry.file_size for entry in entries) > XLSX_MAX_UNCOMPRESSED_BYTES:
+                    raise WorkspaceError("Excel 文件解压后超过读取限制")
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise WorkspaceError("Excel 文件已损坏、格式不正确或已加密") from exc
+
+        try:
+            workbook = load_workbook(
+                path,
+                read_only=True,
+                data_only=True,
+                keep_links=False,
+            )
+        except Exception as exc:
+            raise WorkspaceError("Excel 文件已损坏、格式不正确或已加密") from exc
+
+        try:
+            if len(workbook.worksheets) > XLSX_MAX_SHEETS:
+                raise WorkspaceError(
+                    f"Excel 工作表超过 {XLSX_MAX_SHEETS} 个，拒绝读取"
+                )
+            total_cells = 0
+            sections = [f"[Excel 工作簿：{path.name}]"]
+            for sheet in workbook.worksheets:
+                rows = int(sheet.max_row or 0)
+                columns = int(sheet.max_column or 0)
+                if rows > XLSX_MAX_ROWS_PER_SHEET:
+                    raise WorkspaceError(
+                        f"工作表 {sheet.title} 超过 {XLSX_MAX_ROWS_PER_SHEET} 行，拒绝读取"
+                    )
+                if columns > XLSX_MAX_COLUMNS_PER_SHEET:
+                    raise WorkspaceError(
+                        f"工作表 {sheet.title} 超过 {XLSX_MAX_COLUMNS_PER_SHEET} 列，拒绝读取"
+                    )
+                total_cells += rows * columns
+                if total_cells > XLSX_MAX_CELLS:
+                    raise WorkspaceError(
+                        f"Excel 有效单元格范围超过 {XLSX_MAX_CELLS} 格，拒绝读取"
+                    )
+
+                sections.append(f"\n[工作表：{sheet.title}，{rows} 行 × {columns} 列]")
+                if columns:
+                    column_names = [
+                        _excel_column_name(index) for index in range(1, columns + 1)
+                    ]
+                    sections.append("行号\t" + "\t".join(column_names))
+                if rows and columns:
+                    for row_number, row in enumerate(
+                        sheet.iter_rows(min_row=1, max_row=rows, max_col=columns),
+                        start=1,
+                    ):
+                        values = [_excel_cell_text(cell.value) for cell in row]
+                        sections.append(f"{row_number}\t" + "\t".join(values))
+
+            value = "\n".join(sections)
+            if len(value) > self.max_text_chars:
+                raise WorkspaceError("Excel 内容过长，请缩小工作簿后再读取")
+            return value
+        finally:
+            workbook.close()
 
     def write_text(self, group_id: str, relative: str, content: str) -> Path:
         if len(content) > self.max_text_chars:

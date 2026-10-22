@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import time
@@ -109,6 +110,20 @@ class MemoryStore:
         )
         self._db.commit()
         self._lock = asyncio.Lock()
+        self.memory_service = None
+        self._db.executescript('''
+            CREATE TABLE IF NOT EXISTS memory_outbox(
+                id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS memory_context(
+                message INTEGER PRIMARY KEY,event TEXT NOT NULL,refs TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS memory_files(
+                conversation TEXT NOT NULL,path TEXT NOT NULL,refs TEXT NOT NULL,
+                PRIMARY KEY(conversation,path));
+            CREATE TRIGGER IF NOT EXISTS memory_context_cleanup AFTER DELETE ON chat_messages
+                BEGIN DELETE FROM memory_context WHERE message=OLD.id; END;
+        ''')
 
     async def claim(self, message_id: str) -> bool:
         async with self._lock:
@@ -153,6 +168,8 @@ class MemoryStore:
                     for relative_path, content_type in attachments
                 ),
             )
+            if self.memory_service is not None:
+                self.memory_service.record_message(self._db, chat_message_id, is_bot)
             self._db.commit()
             return chat_message_id
 
@@ -160,18 +177,39 @@ class MemoryStore:
         async with self._lock:
             rows = self._db.execute(
                 """
-                SELECT user_id, username, content, is_bot
-                FROM chat_messages
+                SELECT user_id, username, content, is_bot, event, refs
+                FROM chat_messages LEFT JOIN memory_context ON memory_context.message=chat_messages.id
                 WHERE group_id = ?
                 ORDER BY id DESC
                 LIMIT ?
                 """,
                 (group_id, limit),
             ).fetchall()
+        if self.memory_service is not None:
+            rows = self.memory_service.filter_history(rows)
         return [
             ChatLine(row[1], row[2], bool(row[3]), str(row[0]))
             for row in reversed(rows)
         ]
+
+    def memory_pending(self, now):
+        row = self._db.execute("SELECT id,payload,attempts FROM memory_outbox WHERE status='pending' "
+                               "AND next_at<=? ORDER BY created LIMIT 1", (now,)).fetchone()
+        return (row[0], json.loads(row[1]), row[2]) if row else None
+
+    def memory_finish(self, identity):
+        with self._db:
+            self._db.execute("UPDATE memory_outbox SET status='done',payload='{}',error='' WHERE id=?", (identity,))
+
+    def memory_retry(self, identity, now, delay, error):
+        with self._db:
+            self._db.execute('UPDATE memory_outbox SET attempts=attempts+1,next_at=?,error=? WHERE id=?',
+                             (now+delay, error, identity))
+
+    def memory_status(self):
+        row = self._db.execute("SELECT count(*),min(created),sum(error!='') FROM memory_outbox "
+                               "WHERE status='pending'").fetchone()
+        return {'pending': row[0], 'oldest_at': row[1], 'failed_pending': row[2] or 0}
 
     async def reset_group(self, group_id: str) -> None:
         async with self._lock:

@@ -1,5 +1,17 @@
 .env
+.wechat-server.env
+.release.env
+shared-memory/
+memory-identity/
+wechat-data/
+deploy-backups/
+releases/
+observations/
+ops-tools/
 .image-adapter.env
+.wechat-probe/
+.wechat.env
+.venv-wechat/
 data/*
 !data/.gitkeep
 workspace/*

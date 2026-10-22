@@ -4,7 +4,12 @@ import os
 import tempfile
 import time
 import unittest
+import zipfile
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
+
+from openpyxl import Workbook
 
 from app.workspace import GroupWorkspace, WorkspaceError
 
@@ -18,6 +23,31 @@ class WorkspaceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def make_workbook(self, name: str = "学生信息.xlsx") -> Path:
+        path = self.workspace.inbox_path("group-a", name, "message")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "学生表"
+        sheet.append(["姓名", "身份证号", "入学日期", "公式", "空列"])
+        sheet.append(["小明", "11010120000101001X", date(2026, 9, 1), "=1+1", None])
+        second = workbook.create_sheet("说明")
+        second["A1"] = "中文说明"
+        workbook.save(path)
+        workbook.close()
+        # openpyxl does not calculate formulas. Inject the cached value that a
+        # spreadsheet application would normally store so data_only is tested.
+        replacement = path.with_suffix(".cached.xlsx")
+        with zipfile.ZipFile(path) as source, zipfile.ZipFile(replacement, "w") as target:
+            for entry in source.infolist():
+                payload = source.read(entry.filename)
+                if entry.filename == "xl/worksheets/sheet1.xml":
+                    payload = payload.replace(
+                        b"<f>1+1</f><v />", b"<f>1+1</f><v>2</v>"
+                    )
+                target.writestr(entry, payload)
+        os.replace(replacement, path)
+        return path
 
     def test_groups_are_isolated(self) -> None:
         self.workspace.write_text("group-a", "notes/todo.md", "A")
@@ -125,6 +155,41 @@ class WorkspaceTests(unittest.TestCase):
     def test_pdf_requires_pdf_extension(self) -> None:
         with self.assertRaises(WorkspaceError):
             self.workspace.write_pdf("group-a", "wrong.txt", "标题", "内容")
+
+    def test_reads_xlsx_sheets_and_typed_cells(self) -> None:
+        self.make_workbook()
+        value = self.workspace.read_text("group-a", "inbox/学生信息.xlsx")
+        self.assertIn("[工作表：学生表，2 行 × 5 列]", value)
+        self.assertIn("[工作表：说明，1 行 × 1 列]", value)
+        self.assertIn("行号\tA\tB\tC\tD\tE", value)
+        self.assertIn("11010120000101001X", value)
+        self.assertIn("2026-09-01", value)
+        self.assertNotIn("=1+1", value)
+        student_row = next(
+            line for line in value.splitlines() if "11010120000101001X" in line
+        )
+        self.assertEqual(student_row.split("\t")[4], "2")
+        self.assertEqual(student_row.split("\t")[5], "")
+
+    def test_rejects_legacy_xls_and_corrupt_xlsx(self) -> None:
+        legacy = self.workspace.inbox_path("group-a", "legacy.xls", "message")
+        legacy.write_bytes(b"legacy")
+        with self.assertRaisesRegex(WorkspaceError, "暂不支持旧版"):
+            self.workspace.read_text("group-a", "inbox/legacy.xls")
+
+        corrupt = self.workspace.inbox_path("group-a", "corrupt.xlsx", "message")
+        corrupt.write_bytes(b"not an xlsx archive")
+        with self.assertRaisesRegex(WorkspaceError, "损坏.*加密"):
+            self.workspace.read_text("group-a", "inbox/corrupt.xlsx")
+
+    def test_rejects_xlsx_dimension_and_uncompressed_size_limits(self) -> None:
+        self.make_workbook("limited.xlsx")
+        with patch("app.workspace.XLSX_MAX_ROWS_PER_SHEET", 1):
+            with self.assertRaisesRegex(WorkspaceError, "超过 1 行"):
+                self.workspace.read_text("group-a", "inbox/limited.xlsx")
+        with patch("app.workspace.XLSX_MAX_UNCOMPRESSED_BYTES", 1):
+            with self.assertRaisesRegex(WorkspaceError, "解压后超过"):
+                self.workspace.read_text("group-a", "inbox/limited.xlsx")
 
 
 

@@ -139,7 +139,9 @@ class Settings:
     qq_token_url: str = "https://api.bot.qq.com/app/getAppAccessToken"
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls, *, channel: str = "qq") -> "Settings":
+        if channel not in {"qq", "wechat"}:
+            raise ValueError("不支持的消息渠道")
         api_format = os.getenv("LLM_API_FORMAT", "anthropic").strip().lower()
         if api_format not in {"anthropic", "openai"}:
             raise ValueError("LLM_API_FORMAT 只能是 anthropic 或 openai")
@@ -204,7 +206,7 @@ class Settings:
         if not 0 <= good_morning_hour <= 23 or not 0 <= good_morning_minute <= 59:
             raise ValueError("GOOD_MORNING_TIME 必须是有效的 24 小时时间")
 
-        good_morning_enabled = _bool("GOOD_MORNING_ENABLED", False)
+        good_morning_enabled = channel == "qq" and _bool("GOOD_MORNING_ENABLED", False)
         owner_user_ids = frozenset(_csv("OWNER_USER_IDS"))
         bilibili_enabled = _bool("BILIBILI_ENABLED", False)
         bilibili_token = os.getenv("BILIBILI_QQCHAT_TOKEN", "").strip()
@@ -215,8 +217,8 @@ class Settings:
         if bilibili_enabled and not bilibili_token:
             raise ValueError("启用 Bilibili 读取时必须配置 BILIBILI_QQCHAT_TOKEN")
         return cls(
-            qq_app_id=_required("QQ_APP_ID"),
-            qq_app_secret=_required("QQ_APP_SECRET"),
+            qq_app_id=_required("QQ_APP_ID") if channel == "qq" else "",
+            qq_app_secret=_required("QQ_APP_SECRET") if channel == "qq" else "",
             llm_base_url=base_url,
             llm_api_key=_required("LLM_API_KEY"),
             llm_model=_required("LLM_MODEL"),
