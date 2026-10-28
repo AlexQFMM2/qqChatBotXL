@@ -6,7 +6,7 @@ from pathlib import Path
 
 import aiohttp
 
-from ..channel import IncomingMessage, TransportError
+from ..channel import IncomingMessage, TransportError, BattleNoticeRejected
 from ..domain import AttachmentRef
 from .client import ProtocolError, SessionExpired, text_item
 from .media import MAX_MEDIA, Media, fit_generated_image, safe_filename
@@ -127,6 +127,41 @@ class WeChatTransport:
                 raise TransportError('微信回复未确认成功，请核对手机；不会自动重发。') from None
             remaining = remaining[len(chunk):]
         return result
+
+    def battle_reply_context(self):
+        if not self.active:
+            return {}
+        return {key: self.active[key] for key in (
+            'message_id', 'context_token', 'from_user_id', 'to_user_id',
+            'message_type', 'message_state') if key in self.active}
+
+    async def send_battle_notice(self, conversation, content, notice_id, *, context=None):
+        # Never bind/replace active: background notices cannot borrow another turn.
+        from .__main__ import allowed_message
+        from .client import DeliveryUnknown
+        if (conversation != self.conversation_id or not context
+                or not allowed_message(context, self.account) or not context.get('context_token')):
+            raise BattleNoticeRejected('本局通知缺少有效回复上下文')
+        identity = 'qqchat-battle-' + hashlib.sha256((self.account['bot_id'] + ':' + notice_id).encode()).hexdigest()[:40]
+        status, response = self.inbox.begin_send(identity, str(context['message_id']))
+        if status == 'sent':
+            return response
+        if status != 'new':
+            raise TransportError('本局通知结果不明，不自动重发')
+        try:
+            result = await self.client.send(self.account['owner'], context['context_token'], text_item(content[:1000]), identity)
+        except DeliveryUnknown:
+            self.inbox.end_send(identity, 'unknown')
+            raise TransportError('本局通知发送结果不明，不会自动重发') from None
+        except asyncio.CancelledError:
+            self.inbox.end_send(identity, 'unknown')
+            raise
+        except ProtocolError:
+            self.inbox.end_send(identity, 'rejected')
+            raise BattleNoticeRejected('微信拒绝了本局通知') from None
+        response = {'id': str(result.get('message_id') or '')}
+        self.inbox.end_send(identity, 'sent', response)
+        return response
 
     async def send_file(self, conversation, path: Path, message_id, *, sequence=1):
         self._check_destination(conversation, message_id)

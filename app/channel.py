@@ -12,6 +12,10 @@ class TransportError(RuntimeError):
     pass
 
 
+class BattleNoticeRejected(TransportError):
+    """The platform/context definitely refused a battle notice before delivery."""
+
+
 @dataclass(frozen=True, slots=True)
 class IncomingMessage:
     channel: str
@@ -45,6 +49,15 @@ class QQTransport:
 
     async def send_text(self, *args, **kwargs):
         return await self.client.send_group_text(*args, **kwargs)
+
+    async def send_battle_notice(self, conversation, content, notice_id, *, context=None):
+        from .qq import QQAPIError
+        try:
+            return await self.client.send_group_text(conversation, content)
+        except QQAPIError as exc:
+            if exc.delivery_rejected:
+                raise BattleNoticeRejected("群通知被平台拒绝") from exc
+            raise TransportError("群通知发送结果不明") from exc
 
     async def send_file(self, *args, **kwargs):
         return await self.client.send_group_file(*args, **kwargs)

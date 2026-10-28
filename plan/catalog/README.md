@@ -8,6 +8,7 @@
 
 | 计划 | Owner | 更新时间 | 路径 |
 |---|---|---|---|
+| 宝可梦图鉴与全局单局对战（本地实现及 329 项回归、真实 HTTP 联调通过；待部署和手机验收，怪猎延期） | 当前执行者，单执行者串行；维护者负责最终体验验收 | 2026-10-28 | [计划与接口设计](../game-catalog-battle/README.md) · [任务](../game-catalog-battle/tasks.md) · [台账](../game-catalog-battle/taskList.md) |
 | QQChat 微信私聊与共享长期记忆（双端已常驻，最新时间修复 305 项应用测试；真实跨端与 10-23 实际整理已确认，24 小时观察从 10-23 15:01:45 重算；共享文件延期） | 当前执行者负责实现与集成；项目维护者负责扫码与用户验收 | 2026-10-23 | [交接记录](../wechat-private-chat/handoff.md) · [计划与方案取舍](../wechat-private-chat/README.md) · [任务](../wechat-private-chat/tasks.md) · [进度](../wechat-private-chat/taskList.md) |
 
 ## 已完成

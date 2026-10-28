@@ -21,6 +21,7 @@
 |---|---|---|
 | 微信接入、共享记忆、常驻 | 已实现主要能力；总计划进行中，仍有观察及原有未验收项 | [当前交接](wechat-private-chat/handoff.md)、[任务台账](wechat-private-chat/taskList.md) |
 | Fusion 配置与主模型工具调度 | 已完成；F-001～F-005 全部验收 | [发布与验收证据](fusion-media/README.md)、[任务台账](fusion-media/taskList.md) |
+| 宝可梦图鉴与单局对战 | 进行中；本地实现、329 项应用回归及真实 HTTP 联调通过。怪猎延期，CB 只改服务端；全局一局、忙碌拦截、5 分钟超时和原会话总结已实现。默认关闭，待部署与手机验收 | [计划](game-catalog-battle/README.md)、[任务](game-catalog-battle/tasks.md)、[台账](game-catalog-battle/taskList.md) |
 | 授权文件跨端共享 | T-017 明确延期 | [原计划](wechat-private-chat/README.md) |
 
 ## 用户已确认的方向

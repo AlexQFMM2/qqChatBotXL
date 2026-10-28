@@ -139,6 +139,11 @@ class Settings:
     qq_api_base: str = "https://api.bot.qq.com"
     qq_token_url: str = "https://api.bot.qq.com/app/getAppAccessToken"
 
+    pokemon_service_url: str = ""
+    pokemon_service_token: str = ""
+    pokemon_dex_enabled: bool = False
+    pokemon_battle_enabled: bool = False
+
     @classmethod
     def from_env(cls, *, channel: str = "qq") -> "Settings":
         if channel not in {"qq", "wechat"}:
@@ -360,4 +365,8 @@ class Settings:
             ),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             log_message_content=_bool("LOG_MESSAGE_CONTENT", False),
+            pokemon_service_url=os.getenv("POKEMON_SERVICE_URL", "").strip().rstrip("/"),
+            pokemon_service_token=os.getenv("POKEMON_SERVICE_TOKEN", "").strip(),
+            pokemon_dex_enabled=_bool("POKEMON_DEX_ENABLED", False),
+            pokemon_battle_enabled=_bool("POKEMON_BATTLE_ENABLED", False),
         )

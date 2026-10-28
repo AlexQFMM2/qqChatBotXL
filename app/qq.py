@@ -23,7 +23,9 @@ _COMMON_SECRET = re.compile(
 )
 
 class QQAPIError(TransportError):
-    pass
+    def __init__(self, message: str, *, delivery_rejected: bool = False):
+        super().__init__(message)
+        self.delivery_rejected = delivery_rejected
 
 
 class AccessTokenManager:
@@ -47,7 +49,7 @@ class AccessTokenManager:
             ) as response:
                 data = await response.json(content_type=None)
                 if response.status >= 400 or "access_token" not in data:
-                    raise QQAPIError(f"获取 QQ access_token 失败：HTTP {response.status} {str(data)[:400]}")
+                    raise QQAPIError(f"获取 QQ access_token 失败：HTTP {response.status} {str(data)[:400]}", delivery_rejected=True)
                 self._token = str(data["access_token"])
                 self._expires_at = time.monotonic() + int(data.get("expires_in", 7200))
                 return self._token
@@ -127,7 +129,8 @@ class QQClient:
         ) as response:
             data = await response.json(content_type=None)
             if response.status >= 400:
-                raise QQAPIError(f"发送群消息失败：HTTP {response.status} {str(data)[:500]}")
+                raise QQAPIError(f"发送群消息失败：HTTP {response.status} {str(data)[:500]}",
+                    delivery_rejected=response.status in {400, 401, 403, 404, 413, 422, 429})
             return data
 
     async def send_group_file(

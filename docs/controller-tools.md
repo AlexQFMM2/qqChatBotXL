@@ -42,3 +42,10 @@ CCR 返回可下载的图片地址。机器人检查 HTTPS 域名、下载大小
 - 图片与文件来源局限当前会话；发出的表情不自动进入用户图片上下文。记忆撤销检查覆盖工具执行与最终发送。
 - 发送结果不明或登录失效时停止该条消息后续操作，不能自动重发。跨消息重试必须由新入站请求提供上下文。
 - Anthropic 与 OpenAI 兼容模式均执行实际工具循环。Bilibili 保留已有专用工作流；歌曲生成、微信原生语音气泡和授权文件跨端共享未新增。
+
+## 宝可梦（按独立开关启用）
+
+- `pokemon_dex`：`action=search|detail`，`category=pokemon|moves|abilities|items`；搜索后使用返回英文 ID，详情可选 `section=learnset` 与 `offset`。每条消息最多四次读取，模型不能指定 SQL、URL 或文件。
+- `pokemon_battle`：`action=start|select|act|status|end`；选队传三个不同 `selection` 编号；出招传本轮视图的 `action_id`。身份、对局、预期版本和操作键由程序注入；每条消息最多一个变更，对手始终由 CB AI 指挥。
+- 全局占用检查在普通业务之前：其他用户所有应答请求只返回忙碌。主模型不负责判定权限或突破占用限制。
+- 游戏数值、选项和结算由程序保底展示；模型仅基于工具事实简短解说。详见 [服务接入与恢复](game-services.md)。

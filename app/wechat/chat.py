@@ -14,9 +14,11 @@ from pathlib import Path
 import aiohttp
 
 from ..bot import PersonaBot
+from ..channel import IncomingMessage
 from ..config import Settings
 from ..llm import LLMClient, LLMError
 from ..memory.service import MemoryService
+from ..pokemon import BUSY, PokemonError
 from ..webtools import WebTools
 from .__main__ import DEFAULT_STATE
 from .client import ProtocolError, PublicResolver, SessionExpired, WeChatClient
@@ -145,13 +147,13 @@ class ChatRuntime:
         self.inbox.mark(identity, 'running')
         try:
             if status == 'interrupted':
-                await self.transport.send_text(self.transport.conversation_id,
+                await self.reply_without_controller(
                     '上次处理期间服务重启了，结果可能尚未送达。为避免重复执行，我没有自动重做；'
                     '可以用 /files 检查已生成文件，再发消息告诉我如何继续。', identity)
             else:
                 message, rejection = self.transport.normalize(self.bot._settings.owner_title)
                 if rejection:
-                    await self.transport.send_text(self.transport.conversation_id, rejection, identity)
+                    await self.reply_without_controller(rejection, identity)
                 else:
                     # The durable channel queue owns ordering and recovery. Reuse the
                     # complete common handler, without a second in-memory QQ queue.
@@ -177,6 +179,18 @@ class ChatRuntime:
             self.login_ready = False
             self.last_error = 'SessionExpired'
         return True
+
+    async def reply_without_controller(self, content, identity):
+        # Normalization errors and interrupted inputs are also answered entrances.
+        games = getattr(self.bot, '_pokemon', None)
+        if games:
+            message = IncomingMessage('wechat', self.transport.conversation_id, str(identity),
+                self.transport.account['owner'], self.bot._settings.owner_title, 'owner', '', '')
+            try:
+                if (await games.gate(message))['status'] == 'busy': content = BUSY
+            except PokemonError as exc:
+                content = str(exc)
+        await self.transport.send_text(self.transport.conversation_id, content, identity)
 
     async def work(self):
         while not self.stop.is_set():
@@ -220,6 +234,8 @@ class ChatRuntime:
             await asyncio.sleep(5)
 
     async def run(self):
+        if self.bot is not None:
+            self.bot.start_games()
         self.inbox.recover()
         receiver = asyncio.create_task(self.receive())
         worker = asyncio.create_task(self.work())
@@ -241,6 +257,8 @@ class ChatRuntime:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.bot is not None:
+                await self.bot.close()
             if self.state:
                 self.state.write('health.json', {**self.health(), 'alive': False})
 
