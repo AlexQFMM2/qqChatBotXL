@@ -27,7 +27,7 @@ from .bilibili import (
     references_previous_bilibili,
     requested_sections,
 )
-from .pokemon import PokemonClient, PokemonGames, PokemonError, TOOLS as POKEMON_TOOLS, BUSY as POKEMON_BUSY, TERMINAL as POKEMON_TERMINAL, render_battle
+from .pokemon import BATTLE_ROLE_PROMPT, battle_facts, PokemonClient, PokemonGames, PokemonError, TOOLS as POKEMON_TOOLS, BUSY as POKEMON_BUSY, TERMINAL as POKEMON_TERMINAL, render_battle
 from .channel import IncomingMessage, QQTransport, Transport, TransportError
 from .memory.transport import MemoryTransport
 from .config import Settings
@@ -397,8 +397,8 @@ class PersonaBot:
 
     async def _pokemon_closing(self, view):
         persona = Path(self._settings.persona_path).read_text(encoding='utf-8').strip()
-        facts = {k: view.get(k) for k in ('phase', 'winner', 'reason', 'summary', 'turn', 'events', 'environment')}
-        raw = await self._llm.complete(persona + '\n你正在亲自与用户对战。p1是用户，p2是你（夏莉）。',
+        facts = battle_facts(view)
+        raw = await self._llm.complete(persona + BATTLE_ROLE_PROMPT,
             '这局已经结束。只写两句简短、自然、有夏莉个性的赛后感想，称自己为“我”，直接对用户说话。'
             '可以不服输、开心或惋惜，避免机械播报和旁观解说；不得声称另一个AI替你下指令。'
             '必须尊重下面的真实结果，超时/故障不能判胜负。不编造招式、属性、操作动机或逆转。'
@@ -966,6 +966,7 @@ class PersonaBot:
                     channel=message.channel,
                 )
                 if game_turn:
+                    persona += BATTLE_ROLE_PROMPT
                     user_prompt += game_turn.prompt()
                 current_image_count = sum(
                     attachment.content_type.startswith("image")
@@ -1063,7 +1064,7 @@ class PersonaBot:
                             game_preparation_sent = True
                             await self.transport.send_text(group_id, '正在准备对局…', message_id, sequence=next_sequence)
                             next_sequence += 1
-                        return json.dumps(result, ensure_ascii=False)
+                        return json.dumps(battle_facts(result, game_turn.cursor) if name == 'pokemon_battle' else result, ensure_ascii=False)
                     if name in {"understand_images", "generate_image", "send_voice", "recent_requests"}:
                         schema = next(tool["input_schema"] for tool in tools if tool["name"] == name)
                         if set(arguments) - set(schema["properties"]):
@@ -1242,18 +1243,14 @@ class PersonaBot:
                     if game_turn.last_view:
                         current_row = games.store.get(game_turn.last_view['id'])
                         if current_row and current_row['view'].get('phase') in POKEMON_TERMINAL:
-                            if (game_turn.is_status and not game_notice_sent
-                                    and current_row['notice'] in ('sent', 'unknown')):
-                                await self._send(group_id, message_id, render_battle(current_row['view']), sequence=next_sequence)
-                            else:
+                            # An explicit read of a delivered/uncertain result may answer a follow-up.
+                            # A newly discovered result still goes through the single-notice path.
+                            if not (game_turn.is_status and current_row['notice'] in ('sent', 'unknown')):
                                 await games.notify(current_row['id'], message, next_sequence)
-                            return
+                                return
                     availability = await games.gate(message)
                     if availability['status'] == 'busy':
                         await self._send(group_id, message_id, POKEMON_BUSY, sequence=next_sequence)
-                        return
-                    if game_turn.last_view and game_turn.last_view.get('phase') in POKEMON_TERMINAL:
-                        await games.notify(game_turn.last_view['id'], message, next_sequence)
                         return
                 raw_reply, emote_name = extract_emote(raw, EMOTE_NAMES)
                 if memory and not memory.valid():
@@ -1263,7 +1260,7 @@ class PersonaBot:
                     self._settings.max_reply_chars,
                     (self._settings.bot_name, *self._settings.bot_aliases),
                 )
-                if game_turn and game_turn.last_view:
+                if game_turn and game_turn.last_view and game_turn.last_view.get('phase') not in POKEMON_TERMINAL:
                     reply = (reply[:250] + "\n" + render_battle(game_turn.last_view, game_turn.cursor)).strip()
                     row = games.store.get(game_turn.last_view['id'])
                     row['event_cursor'] = max([e['id'] for e in game_turn.last_view.get('events', [])] or [row['event_cursor']])

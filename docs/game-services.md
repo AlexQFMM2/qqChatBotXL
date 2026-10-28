@@ -62,3 +62,11 @@ CB 的 `pnpm --filter @changebattle-v2/api test:chat-battle` 验证生成器、3
 `POST /chat-battles` 进入 `rules`，返回 `environments`；`POST /chat-battles/:id/configure` 使用同一身份、revision、operationId，提交 `environment=standard|gen7|gen8|gen9`。成功后生成固定六候选并进入 `selecting`。选环境阶段同样有 5 分钟上限，无效选择不续时；选择后不能中途更换规则。其余操作沿用原接口。
 
 版本 2 的开局阶段与版本 1 不同，CB 与机器人应配套升级/回退；发布前确认全局聊天占用为空及原 CB 引擎空闲。原正式房间和客户端接口不变。
+
+## 对战者身份与复盘
+
+CB AI 是夏莉的对战能力；用户在与夏莉本人对战。模型收到的工具事实使用 `human_player`（用户的六候选、选定队伍和合法操作）与 `assistant_player`（夏莉公开出场的宝可梦），事件改用固定阵营名称，避免“我/你”视角颠倒。面向玩家的回复仍用第一人称，并清楚说明双方各自配队。
+
+现有绑定JSON保留玩家六候选及夏莉公开出场记录；同一用户在同一会话的最近终局会直接补入模型上下文，供赛后追问。它是程序事实，优先于旧聊天中说错的台词；不使用模型感想当战斗证据，也不开放夏莉尚未公开的队伍。旧记录缺失的六候选不靠聊天臆测重建。
+
+`python scripts/check_pokemon_roleplay.py` 是按需真实配置模型检查：只使用合成战况和替身传输，不连接CB、不发平台消息。输出需要逐条人工检查身份、归属和时态；脚本跑通不代表自然语言全部正确。

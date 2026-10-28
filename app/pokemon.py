@@ -19,6 +19,19 @@ LOGGER = logging.getLogger(__name__)
 BUSY = '正在和其他人进行宝可梦对战，等结束再说吧。'
 TERMINAL = {'ended', 'cancelled', 'expired', 'failed', 'interrupted'}
 
+BATTLE_ROLE_PROMPT = '''
+[宝可梦对战身份与事实规则]
+你本人（夏莉）就是正在与用户对战的训练家。pokemon_battle / CB AI 是你自己的对战能力，像其他工具一样由你调用；它完成的夏莉方出招、换人就是你的行动。自然说“我派出…”“我的…”，不要把自己写成旁观者或另一个AI的解说员。用户明确问实现时可如实解释工具。
+工具事实按角色命名：human_player 始终是当前用户/老师；assistant_player 始终是你本人/夏莉。human_player 的候选、队伍、招式只能称“你的”；assistant_player 的已公开宝可梦才能称“我的”。相同种族也按阵营区分，不能单凭名字判断归属。
+六只候选全部属于用户，用户选三只后，你另外独立随机三只，双方不共用六选三池。不能把用户未选的宝可梦当成自己的；不得捏造尚未公开的己方队伍。
+战斗工具负责同时落实用户指令和你的决策，act 只用于提交用户明确指定的合法动作，不能再额外替任何一方发指令。叙述仅以工具的最新公开事实为准，历史聊天中的口误和角色台词不是战斗事实。
+只回应已经发生的动作与结果。换人后尚未结算的攻击不能说成已经发生或必然发生；不要编造出招动机、下一招、属性克制/特性/伤害倍率。不确定的机制先查图鉴，证据不足就坦诚说明。
+开局先让用户选择环境，再六选三。普通招式不得附加太晶、Mega、极巨化或Z，特殊动作需用户本条消息明确要求。普通聊天/图鉴/复盘不得调用出招。
+选环境、选队或出招后只写一两句简短自然的对手回应；不重复环境菜单、候选清单、队伍卡片、合法动作或整段战报，程序会附上。复盘时直接回答问题；发现先前归属说反就直接纠正，不要猜用户看漏、记错或没认出形态。
+已结束的最近一局仅供复盘，不是活动局。结果为中断时不判胜负。终局感想只能依据标明阵营的真实结果，不需要重复数字或列表。
+'''
+
+
 TOOLS = [
     {'name': 'pokemon_dex', 'description': '查询 ChangeBattle 宝可梦图鉴。先 search 获取英文 id；多项命中需区分形态。detail 查询种族值、进化、招式、特性或道具。只代表当前项目数据。',
      'input_schema': {'type': 'object', 'properties': {
@@ -27,7 +40,7 @@ TOOLS = [
          'query': {'type': 'string'}, 'id': {'type': 'string'},
          'section': {'type': 'string', 'enum': ['basic', 'learnset']}, 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 10000}},
          'required': ['action', 'category'], 'additionalProperties': False}},
-    {'name': 'pokemon_battle', 'description': '与用户进行随机宝可梦对战。start 开局先让用户选择环境；configure 按用户明确选择设置环境并生成六候选；select 按顺序选三个编号；act 转交明确指定的合法 action_id，特殊机制必须本条消息明确要求；status 查看；end 取消或认输。不能替用户做选择，同一消息最多一次变更。',
+    {'name': 'pokemon_battle', 'description': '这是你（夏莉）自己的宝可梦对战能力；CB为你落实己方战斗决策，你本人在与用户对战。返回human_player是用户，assistant_player是你。六候选只属于用户，你另随机三只。start 开局先让用户选择环境；configure 按用户明确选择设置环境并生成六候选；select 按顺序选三个编号；act 转交明确指定的合法 action_id，特殊机制必须本条消息明确要求；status 查看；end 取消或认输。不能替用户做选择，同一消息最多一次变更。',
      'input_schema': {'type': 'object', 'properties': {
          'action': {'type': 'string', 'enum': ['start', 'configure', 'select', 'act', 'status', 'end']},
          'environment': {'type': 'string', 'enum': ['standard', 'gen7', 'gen8', 'gen9']},
@@ -103,6 +116,12 @@ class BattleStore:
         row = cursor.fetchone()
         return self.decode(dict(zip([d[0] for d in cursor.description], row))) if row else None
 
+    def latest(self, owner):
+        cursor = self.db.execute('SELECT * FROM game_battle_bindings WHERE owner=? AND updated>? ORDER BY updated DESC LIMIT 1',
+                                 (owner, time.time()-7*86400))
+        row = cursor.fetchone()
+        return self.decode(dict(zip([d[0] for d in cursor.description], row))) if row else None
+
     def due(self):
         cursor = self.db.execute("SELECT * FROM game_battle_bindings WHERE notice IN ('','pending') ORDER BY updated")
         return [self.decode(dict(zip([d[0] for d in cursor.description], r))) for r in cursor.fetchall()]
@@ -136,12 +155,37 @@ class BattleStore:
             self.db.execute("DELETE FROM game_battle_bindings WHERE updated<? AND notice='sent'", (time.time()-7*86400,))
 
 
+def neutral_battle_text(text):
+    # CB's public strings are addressed to the human; remove shifting pronouns for model input.
+    return (text or '').replace('你方', '玩家方').replace('我方', '夏莉方').replace('你获胜', '玩家获胜').replace('我获胜', '夏莉获胜')
+
+
+def battle_facts(view, cursor=0):
+    """Model-only, explicitly owned facts; never expose raw snapshots, local keys or character guesses."""
+    if not view or 'phase' not in view: return view
+    fields = ('phase', 'environment', 'environments', 'turn', 'expiresAt')
+    events = [{'id': e['id'], 'text': neutral_battle_text(e['text'])} for e in view.get('events', [])]
+    return {**{k: view.get(k) for k in fields},
+        'human_player': {'identity': '当前用户/老师（对话中的你）',
+                         'candidate_pool': view.get('playerCandidates') or view.get('candidates', []),
+                         'selected_team': view.get('team', []), 'legal_actions': view.get('actions', [])},
+        'assistant_player': {'identity': '夏莉（正在回复的你本人，对话中的我）',
+                             'team_source': '用户选好三只后，为夏莉独立随机三只，不来自用户的六候选',
+                             'active_pokemon': view.get('opponent'),
+                             'revealed_pokemon': view.get('assistantRevealed', [])},
+        'team_selection_rule': '用户六选三；夏莉另外独立随机三只，双方不共用候选池',
+        'public_events': events, 'new_public_events': [e for e in events if e['id'] > cursor],
+        'events_truncated': bool(view.get('eventsTruncated')),
+        'result': {'winner': {'p1': 'human_player', 'p2': 'assistant_player'}.get(view.get('winner')),
+                   'reason': view.get('reason', ''), 'summary': neutral_battle_text(view.get('summary', ''))}}
+
+
 def render_battle(view, cursor=0):
     if view.get('phase') in TERMINAL:
         return '\n'.join(s for s in (view.get('closing'), view.get('summary') or '本局已中断，不判胜负。') if s)
     if view.get('phase') == 'rules':
         return '\n'.join(['来，先选我们这局的对战环境：'] + [f"{i}. {e['label']}" for i,e in enumerate(view.get('environments', []),1)]
-            + ['双方固定 50 级，随机六选三。回复环境名称或编号，5 分钟不操作会结束。'])
+            + ['双方固定 50 级。你从六只候选里选三只，我另外随机三只。回复环境名称或编号，5 分钟不操作会结束。'])
     environment = view.get('environment') or {}
     def details(p):
         lines = [f"属性：{' / '.join(p.get('types', [])) or '—'}｜性格：{p.get('nature', '—')}（{p.get('natureEffect', '无能力增减')}）",
@@ -153,7 +197,7 @@ def render_battle(view, cursor=0):
         lines = [f"环境：{environment.get('label', '已选定')}\n你的六只候选："]
         for p in view.get('candidates', []):
             lines += [f"\n{p['slot']}. {p['name']} Lv.{p['level']}", *details(p), '招式：' + ' / '.join(p['moves'])]
-        return '\n'.join(lines + ['选三个不同编号，第一只是首发，例如“选 2、5、1”。5 分钟不操作会结束。'])
+        return '\n'.join(lines + ['这六只是你的候选。选三个不同编号，第一只是首发，例如“选 2、5、1”；选好后我另外随机三只。5 分钟不操作会结束。'])
     lines = [f"第 {view.get('turn', 0)} 回合"]
     lines += [e['text'] for e in view.get('events', []) if e['id'] > cursor]
     opponent = view.get('opponent') or {}
@@ -203,7 +247,7 @@ class PokemonGames:
         result = await self.client.request('GET', '/chat-battles/availability', owner=owner)
         if result['status'] == 'self':
             view = result['battle']; row = self.store.get(view['id']) or self.store.create(view['id'], owner, message, view)
-            row['view'] = view; self.capture(row); self.store.save(row)
+            self.capture(row); result['battle'] = self.update(row, view)
         return result
 
     def capture(self, row):
@@ -213,11 +257,24 @@ class PokemonGames:
             row['context_until'] = time.time() + 360
 
     def update(self, row, view):
-        if view.get('phase') in TERMINAL and row['view'].get('closing'):
-            view = {**view, 'closing': row['view']['closing']}
+        previous = row['view']
+        view = dict(view)
+        candidates = view.get('candidates') or previous.get('playerCandidates') or previous.get('candidates')
+        if candidates: view['playerCandidates'] = candidates
+        revealed = list(previous.get('assistantRevealed', []))
+        for event in view.get('events', []):
+            if event['text'].startswith('我方换上'):
+                name = event['text'][4:]
+                if name and name not in revealed: revealed.append(name)
+        active = (view.get('opponent') or {}).get('name')
+        if active and active not in revealed: revealed.append(active)
+        view['assistantRevealed'] = revealed[-12:]
+        if view.get('phase') in TERMINAL and previous.get('closing'):
+            view['closing'] = previous['closing']
         row['view'] = view
         if view.get('phase') in TERMINAL and not row['notice']: row['notice'] = 'pending'
         self.store.save(row)
+        return view
 
     def interrupted(self, row):
         self.update(row, {**row['view'], 'phase': 'interrupted', 'summary': '对战服务已重启或本局已失效，本局中断，不判胜负。', 'actions': []})
@@ -239,8 +296,7 @@ class PokemonGames:
         if row['pending']:
             if operation and operation.get('status') in ('done', 'rejected'): row['pending'] = {}
             elif operation and operation.get('status') == 'not_found': return await self.submit_pending(row)
-        self.update(row, view)
-        return view
+        return self.update(row, view)
 
     async def submit_pending(self, row):
         pending = row['pending']
@@ -261,8 +317,8 @@ class PokemonGames:
             old['pending'] = {}; old['view'] = {**old['view'], 'phase': 'cancelled'}
             old['notice'] = 'sent'; old['context'] = {}; self.store.save(old)
             row = self.store.get(view['id']) or {**old, 'id': view['id'], 'notice': ''}
-        row['pending'] = {}; self.update(row, view)
-        return view
+        row['pending'] = {}
+        return self.update(row, view)
 
     async def notify(self, identity, message=None, sequence=1):
         async with self.lock(identity):
@@ -350,14 +406,12 @@ class PokemonTurn:
         self.cursor = (games.store.get(self.view['id']) or {}).get('event_cursor', 0) if self.view else 0
 
     def prompt(self):
-        return ('\n[宝可梦对局]\n' + json.dumps(self.view, ensure_ascii=False) if self.view else '\n[宝可梦对局] 当前没有你的活动对局。') + (
-            '\n[对战角色] 你就是正在和用户对战的夏莉。p1/你方=用户，p2/我方=夏莉自己。'
-            '用“我的宝可梦”“我这招”“你这次换人”自然回应，不用旁观者口吻说“夏莉选择了”或“对手AI决定”。'
-            '只有 pokemon_battle 的真实结果能证明开局/选队/出招已执行。己方决策已经由战斗服务完成，你不能额外替任一方下指令，也不能虚构战果。'
-            '开局必须先展示环境供用户选择，不默认太晶环境。rules 阶段只能 configure/end/status，选定后才六选三。'
-            '双方固定50级。普通招式不能偷偷附加太晶、Mega、极巨化或Z招式；特殊动作必须用户本条消息明确要求。'
-            '用户意图不明确先澄清。动作必须选择本轮视图的 action id；不按旧历史猜编号。'
-            '对战工具执行后用一两句第一人称回应，程序会附完整候选或战况。终局会单独发送我的感想和真实结果，无需重复长篇总结。普通聊天/图鉴查询不调用出招。')
+        if self.view:
+            return '\n[当前宝可梦对局：程序事实，优先于历史台词]\n' + json.dumps(battle_facts(self.view, self.cursor), ensure_ascii=False)
+        recent = self.games.store.latest(self.games.owner(self.message))
+        if recent and recent['view'].get('phase') in TERMINAL and recent['view'].get('summary'):
+            return '\n[当前没有活动对局。以下是同一用户在本会话的最近一局，仅供复盘]\n' + json.dumps(battle_facts(recent['view']), ensure_ascii=False)
+        return '\n[宝可梦对局] 当前用户在本会话没有活动对局或可用的近期结果。'
 
     async def execute(self, name, args):
         if not isinstance(args, dict): raise PokemonError('input', '工具参数必须是对象')
@@ -386,9 +440,9 @@ class PokemonTurn:
         if action == 'status':
             self.is_status = True
             if not self.view:
-                recent = [r for r in self.games.store.all() if r['owner'] == owner and r['view'].get('summary')]
-                if recent:
-                    self.last_view = recent[-1]['view']
+                recent = self.games.store.latest(owner)
+                if recent and recent['view'].get('phase') in TERMINAL and recent['view'].get('summary'):
+                    self.last_view = recent['view']
                     return self.last_view
                 return {'message':'当前没有你的活动对局。'}
             async with self.games.lock(self.view['id']):

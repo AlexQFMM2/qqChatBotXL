@@ -14,7 +14,7 @@ from aiohttp import ClientSession, web
 from app.channel import IncomingMessage, QQTransport, BattleNoticeRejected, TransportError
 from app.llm import LLMError
 from app.qq import QQClient, QQAPIError
-from app.pokemon import PokemonClient, PokemonError, PokemonGames, BattleStore, BUSY, TERMINAL, render_battle
+from app.pokemon import PokemonClient, PokemonError, PokemonGames, BattleStore, BUSY, TERMINAL, render_battle, battle_facts, BATTLE_ROLE_PROMPT
 from app.storage import MemoryStore
 import test_wechat_chat as wx
 
@@ -146,6 +146,47 @@ class GameStateTests(unittest.IsolatedAsyncioTestCase):
         text=self.transport.send_battle_notice.await_args.args[1]
         self.assertIn('不判胜负',text);self.assertIn('等了你好一会儿',text)
         self.assertNotIn('赢',text);self.assertNotIn('获胜',text)
+
+    async def test_model_facts_have_explicit_owners_and_only_public_events(self):
+        view={'id':'private-local-id','phase':'active','turn':2,'team':[{'name':'烈焰猴'}],
+              'candidates':[{'name':'水君'}], 'opponent':{'name':'苍响'},
+              'events':[{'id':1,'text':'你方使用了近身战'},{'id':2,'text':'我方换上苍响'}],
+              'actions':[{'id':'move-1','label':'第一招'}], 'closing':'我以前说错的台词',
+              'debug':{'private':'hidden'}}
+        facts=battle_facts(view,1)
+        self.assertEqual(facts['human_player']['selected_team'][0]['name'],'烈焰猴')
+        self.assertEqual(facts['human_player']['candidate_pool'][0]['name'],'水君')
+        self.assertEqual(facts['assistant_player']['active_pokemon']['name'],'苍响')
+        self.assertEqual(facts['new_public_events'],[{'id':2,'text':'夏莉方换上苍响'}])
+        self.assertIn('独立随机三只',facts['team_selection_rule'])
+        for ambiguous in ('id','team','opponent','candidates','closing','debug'): self.assertNotIn(ambiguous,facts)
+
+    async def test_candidate_ownership_and_public_roster_survive_updates_and_restart(self):
+        await self.start();v=await self.configure()
+        await (await self.turn(incoming(identity='pick'))).execute('pokemon_battle',{'action':'select','selection':[1,2,3]})
+        self.client.view.update(opponent={'name':'鬃岩狼人'},events=[{'id':1,'text':'我方换上鬃岩狼人'}])
+        await self.games.gate(self.message)
+        self.client.view.update(opponent={'name':'苍响'},events=[{'id':2,'text':'我方换上苍响'}])
+        await self.games.tick()
+        row=self.games.store.get(v['id'])
+        self.assertEqual(len(row['view']['playerCandidates']),6)
+        self.assertEqual(row['view']['assistantRevealed'],['鬃岩狼人','苍响'])
+        self.client.finish();await self.games.refresh(row)
+        recovered=PokemonGames(self.settings,self.db,self.client,self.transport)
+        turn=recovered.turn(self.message,await recovered.gate(self.message))
+        prompt=turn.prompt();self.assertIn('仅供复盘',prompt)
+        self.assertIn('鬃岩狼人',prompt);self.assertIn('candidate_pool',prompt)
+        facts=battle_facts(recovered.store.get(v['id'])['view'])
+        self.assertEqual(facts['result']['winner'],'human_player')
+        for msg in (incoming('B'),incoming(conversation='other'),incoming(channel='wechat')):
+            self.assertNotIn('鬃岩狼人',recovered.turn(msg,await recovered.gate(msg)).prompt())
+
+    async def test_recent_result_never_replaces_new_current_game(self):
+        v=await self.start();self.client.finish();await self.games.refresh(self.games.store.get(v['id']))
+        msg=incoming(identity='new-game');turn=await self.turn(msg)
+        await turn.execute('pokemon_battle',{'action':'start'})
+        current=await self.turn(msg)
+        self.assertIn('当前宝可梦对局',current.prompt());self.assertNotIn('仅供复盘',current.prompt())
 
     async def test_cross_channel_busy_and_foreign_scope(self):
         await self.start()
@@ -293,7 +334,7 @@ class BotGameTests(unittest.IsolatedAsyncioTestCase):
             raise LLMError('failed after successful tool')
         self.llm.complete_with_tools.side_effect=start
         await self.process(wx.message('来一场宝可梦对战',identity=10))
-        self.assertIn('对战环境',self.sent_text());self.assertNotIn('六只候选',self.sent_text())
+        self.assertIn('对战环境',self.sent_text());self.assertNotIn('你的六只候选：',self.sent_text())
         async def configure(system,prompt,tools,execute,**kwargs):
             self.assertIn('rules',prompt)
             await execute('pokemon_battle',{'action':'configure','environment':'gen9'})
@@ -309,6 +350,49 @@ class BotGameTests(unittest.IsolatedAsyncioTestCase):
         self.llm.complete_with_tools.side_effect=select
         await self.process(wx.message('选 1 3 5',identity=11))
         self.assertIn('十万伏特',self.sent_text())
+
+    async def test_system_role_and_tool_response_use_same_ownership(self):
+        self.enable()
+        async def controller(system,prompt,tools,execute,**kwargs):
+            self.assertIn('是你自己的对战能力',system)
+            result=json.loads(await execute('pokemon_battle',{'action':'start'}))
+            self.assertEqual(result['human_player']['candidate_pool'],[])
+            self.assertIn('你本人',result['assistant_player']['identity'])
+            self.assertNotIn('team',result);self.assertNotIn('id',result)
+            return '来，选好环境就和我打一场！'
+        self.llm.complete_with_tools.side_effect=controller
+        await self.process(wx.message('来一场宝可梦对战',identity=80))
+        self.assertIn('我另外随机三只',self.sent_text())
+
+    async def test_postgame_question_receives_facts_and_is_not_replaced_by_summary(self):
+        self.enable()
+        async def controller(system,prompt,tools,execute,**kwargs):
+            await execute('pokemon_battle',{'action':'start'});return '来吧'
+        self.llm.complete_with_tools.side_effect=controller
+        await self.process(wx.message(identity=81))
+        games=self.bot._pokemon;self.cb.finish()
+        row=games.store.get(self.cb.view['id']);await games.refresh(row)
+        await games.notify(row['id'])
+        summaries=self.sent_text().count('宝可梦对战结束')
+        async def followup(system,prompt,tools,execute,**kwargs):
+            self.assertIn('仅供复盘',prompt);self.assertIn('human_player',prompt)
+            facts=json.loads(await execute('pokemon_battle',{'action':'status'}))
+            self.assertEqual(facts['result']['winner'],'human_player')
+            return '六候选是你的，我的三只是另外随机的；刚才我把归属说反了。'
+        self.llm.complete_with_tools.side_effect=followup
+        await self.process(wx.message('你哪来的苍响？',identity=82))
+        self.assertIn('六候选是你的',self.sent_text())
+        self.assertEqual(self.sent_text().count('宝可梦对战结束'),summaries)
+        self.assertEqual(games.store.get(row['id'])['notice'],'sent')
+
+    async def test_closing_prompt_excludes_old_narration_and_identifies_winner(self):
+        self.enable();self.llm.complete.return_value='这次我赢啦，下次再来！'
+        result=await self.bot._pokemon_closing({'phase':'ended','winner':'p2','summary':'我获胜了！',
+            'team':[{'name':'水君'}],'opponent':{'name':'苍响'},'closing':'旧的错误归属台词'})
+        system,prompt=self.llm.complete.await_args.args[:2]
+        self.assertIn('是你自己的对战能力',system)
+        self.assertIn('assistant_player',prompt);self.assertNotIn('旧的错误归属台词',prompt)
+        self.assertEqual(result,'这次我赢啦，下次再来！')
 
     async def test_busy_blocks_commands_media_and_llm_before_processing(self):
         self.enable()
