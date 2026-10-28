@@ -2,6 +2,8 @@
 
 实现范围为宝可梦。怪猎图鉴延期。随机配队、规则、对手 AI 使用 ChangeBattle 现有实现，CB 网页/桌面客户端无需更新。
 
+2026-10-28 已按用户要求在原服务器启用 QQ / 微信图鉴与对战。可发送“来一场宝可梦对战”开始测试；发布证据与待确认的手机体验见 [计划记录](../plan/game-catalog-battle/README.md#上线记录2026-10-28-1605-0800)。
+
 ## 启用
 
 先使用包含新接口的 CB 服务端，在原受保护环境配置：
@@ -20,7 +22,7 @@ POKEMON_DEX_ENABLED=true
 POKEMON_BATTLE_ENABLED=true
 ```
 
-默认关闭，不会自动部署或启用。可以先只开图鉴。URL 可包含既有 API base path；容器的 localhost 仅指自身。沿用同机内部网络，无需增加公网端口。CB 服务必须单实例承载聊天协调状态，不部署多个独立副本来分流这组接口。
+代码及示例默认关闭；现有服务器已显式配置为启用。可以先只开图鉴。URL 可包含既有 API base path；容器的 localhost 仅指自身。沿用同机内部网络，无需增加公网端口。CB 服务必须单实例承载聊天协调状态，不部署多个独立副本来分流这组接口。
 
 CB `/health` 增加 `pokemonEnabled`、`chatContractVersion=1`、`chatInstanceId`，原字段保持。新路由在无专用 token 时拒绝启用；不改变原 `CHANGEBATTLE_BATTLE_SERVICE_TOKEN`，公网客户端继续沿用房间鉴权。机器人对战启用后需先查询占用状态；服务不可达时提示状态不可用，不能在状态不明时擅自开局或放行其他业务。
 
