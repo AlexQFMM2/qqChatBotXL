@@ -57,6 +57,11 @@ async def run(root):
                     result=await (await turn(a)).execute('pokemon_dex',{'action':'search','category':'pokemon','query':'烈咬陆鲨'})
                     assert result['rows'][0]['id']=='garchomp'
                     view=await (await turn(a)).execute('pokemon_battle',{'action':'start'})
+                    assert view['phase']=='rules' and not view['candidates']
+                    assert (await games.gate(b))['status']=='busy'
+                    a=replace(a,message_id='configure')
+                    view=await (await turn(a)).execute('pokemon_battle',{'action':'configure','environment':'gen9'})
+                    assert all(p['level']==50 and p['natureEffect'] and p['types'] and p['item'] for p in view['candidates'])
                     assert view['phase']=='selecting' and len(view['candidates'])==6
                     assert (await games.gate(b))['status']=='busy'
                     a=replace(a,message_id='m2')

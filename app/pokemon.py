@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from urllib.parse import quote
 
@@ -26,9 +27,10 @@ TOOLS = [
          'query': {'type': 'string'}, 'id': {'type': 'string'},
          'section': {'type': 'string', 'enum': ['basic', 'learnset']}, 'offset': {'type': 'integer', 'minimum': 0, 'maximum': 10000}},
          'required': ['action', 'category'], 'additionalProperties': False}},
-    {'name': 'pokemon_battle', 'description': '与用户进行随机宝可梦对战。start 开局生成六候选；select 按用户顺序选三个不同编号；act 只能转交用户明确指定的当前合法 action_id，绝不能替用户或对手选择；status 查看；end 取消或认输。同一消息最多一次变更。',
+    {'name': 'pokemon_battle', 'description': '与用户进行随机宝可梦对战。start 开局先让用户选择环境；configure 按用户明确选择设置环境并生成六候选；select 按顺序选三个编号；act 转交明确指定的合法 action_id，特殊机制必须本条消息明确要求；status 查看；end 取消或认输。不能替用户做选择，同一消息最多一次变更。',
      'input_schema': {'type': 'object', 'properties': {
-         'action': {'type': 'string', 'enum': ['start', 'select', 'act', 'status', 'end']},
+         'action': {'type': 'string', 'enum': ['start', 'configure', 'select', 'act', 'status', 'end']},
+         'environment': {'type': 'string', 'enum': ['standard', 'gen7', 'gen8', 'gen9']},
          'selection': {'type': 'array', 'items': {'type': 'integer', 'minimum': 1, 'maximum': 6}, 'minItems': 3, 'maxItems': 3, 'uniqueItems': True},
          'action_id': {'type': 'string'}}, 'required': ['action'], 'additionalProperties': False}},
 ]
@@ -68,7 +70,7 @@ class PokemonClient:
                     messages = {'busy': BUSY, 'stale': '战况已变化，请查看新选项后再发指令。',
                         'instance_changed': '对战服务已重启，本局中断，不判胜负。',
                         'not_found': '本局或图鉴记录不存在。', 'invalid_selection': '请选择三个不同编号（1～6），第一只是首发。',
-                        'invalid_action': '请选择当前合法招式或换人选项。', 'operation_conflict': '同一消息不能执行不同对战操作。',
+                        'invalid_action': '请选择当前合法招式或换人选项。', 'invalid_environment': '请先选择本局对战环境。', 'operation_conflict': '同一消息不能执行不同对战操作。',
                         'start_expired': '这条开局请求已过期，请重新开局。'}
                     raise PokemonError(code, messages.get(code, '宝可梦服务暂时不可用，请稍后再试。'))
                 return result
@@ -135,25 +137,54 @@ class BattleStore:
 
 
 def render_battle(view, cursor=0):
-    if view.get('phase') in TERMINAL: return view.get('summary') or '本局已中断，不判胜负。'
+    if view.get('phase') in TERMINAL:
+        return '\n'.join(s for s in (view.get('closing'), view.get('summary') or '本局已中断，不判胜负。') if s)
+    if view.get('phase') == 'rules':
+        return '\n'.join(['来，先选我们这局的对战环境：'] + [f"{i}. {e['label']}" for i,e in enumerate(view.get('environments', []),1)]
+            + ['双方固定 50 级，随机六选三。回复环境名称或编号，5 分钟不操作会结束。'])
+    environment = view.get('environment') or {}
+    def details(p):
+        lines = [f"属性：{' / '.join(p.get('types', [])) or '—'}｜性格：{p.get('nature', '—')}（{p.get('natureEffect', '无能力增减')}）",
+                 f"特性：{p.get('ability', '—')}｜道具：{p.get('item') or '无'}"]
+        if p.get('mechanics'): lines.append('特殊机制：' + ' / '.join(p['mechanics']))
+        if environment.get('id') == 'gen9': lines.append('太晶属性：' + p.get('teraType', '—'))
+        return lines
     if view.get('phase') == 'selecting':
-        lines = ['你的六只候选：']
+        lines = [f"环境：{environment.get('label', '已选定')}\n你的六只候选："]
         for p in view.get('candidates', []):
-            lines.append(f"{p['slot']}. {p['name']} Lv.{p['level']}：{' / '.join(p['moves'])}")
+            lines += [f"\n{p['slot']}. {p['name']} Lv.{p['level']}", *details(p), '招式：' + ' / '.join(p['moves'])]
         return '\n'.join(lines + ['选三个不同编号，第一只是首发，例如“选 2、5、1”。5 分钟不操作会结束。'])
     lines = [f"第 {view.get('turn', 0)} 回合"]
     lines += [e['text'] for e in view.get('events', []) if e['id'] > cursor]
     opponent = view.get('opponent') or {}
-    if opponent: lines.append(f"对手：{opponent.get('name', '')} {opponent.get('condition', '')}")
-    lines += [f"{'出场' if p['active'] else '后备'} {p['slot']}. {p['name']} {p['condition']}" for p in view.get('team', [])]
+    if opponent: lines.append(f"我方出场：{opponent.get('name', '')} {opponent.get('condition', '')}")
+    for p in view.get('team', []):
+        lines += [f"你方{'出场' if p['active'] else '后备'} {p['slot']}. {p['name']} Lv.{p.get('level', 50)} {p['condition']}", *details(p)]
     lines += [a['label'] for a in view.get('actions', [])]
-    if not view.get('actions'): lines.append('等待引擎结算；可以稍后查看战况。')
-    return '\n'.join(lines)[-3000:]
+    if not view.get('actions'): lines.append('这一轮还在结算，可以稍后查看战况。')
+    return '\n'.join(lines)
+
+
+def fallback_closing(view):
+    if view.get('phase') == 'ended':
+        return {'p1': '这次是你赢啦，下次我可要把这一局赢回来！',
+                'p2': '嘿嘿，这一局我拿下啦。下次再来和我较量吧！'}.get(view.get('winner'), '这次没分出高下呢，下次我们再战！')
+    if view.get('phase') == 'expired': return '等了你好一会儿，这局就先收起来啦。准备好了再来找我！'
+    if view.get('phase') == 'cancelled': return '好，那我们先不打啦，想玩的时候再叫我。'
+    return '这局没能顺利打完，有点可惜呢。等准备好我们重新来过吧。'
+
+
+def explicitly_requests_special(text, special):
+    terms = {'terastallize': r'太晶|tera', 'mega': r'mega|超进化|究极爆发',
+             'max': r'极巨|巨大化|dynamax|gigantamax', 'zmove': r'z\s*(?:招|技能|move)'}
+    term = terms.get(special)
+    return bool(term and re.search(term, text, re.I) and not re.search(r'(?:不|别|不要|不用|禁止).{0,6}(?:'+term+')', text, re.I))
 
 
 class PokemonGames:
-    def __init__(self, settings, store, client, transport):
+    def __init__(self, settings, store, client, transport, narrator=None):
         self.settings, self.store, self.client, self.transport = settings, BattleStore(store), client, transport
+        self.narrator = narrator
         self.locks = {}
         self.task = None
 
@@ -182,6 +213,8 @@ class PokemonGames:
             row['context_until'] = time.time() + 360
 
     def update(self, row, view):
+        if view.get('phase') in TERMINAL and row['view'].get('closing'):
+            view = {**view, 'closing': row['view']['closing']}
         row['view'] = view
         if view.get('phase') in TERMINAL and not row['notice']: row['notice'] = 'pending'
         self.store.save(row)
@@ -237,6 +270,14 @@ class PokemonGames:
             if not row or row['view'].get('phase') not in TERMINAL: return False
             if message and (message.channel, message.conversation_id, message.user_id) != (row['channel'], row['conversation'], row['user_id']): return False
             if row['notice'] == 'failed' and message is None: return False
+            if row['notice'] not in ('pending', 'failed'): return False
+            if not row['view'].get('closing'):
+                closing = ''
+                if self.narrator:
+                    try: closing = await asyncio.wait_for(self.narrator(row['view']), 30)
+                    except Exception: LOGGER.warning('对战结束语生成暂不可用，使用角色兜底')
+                row['view']['closing'] = str(closing or fallback_closing(row['view']))[:240]
+                self.store.save(row)
             if not self.store.claim_notice(identity): return False
             row['notice'] = 'sending'
             try:
@@ -310,9 +351,13 @@ class PokemonTurn:
 
     def prompt(self):
         return ('\n[宝可梦对局]\n' + json.dumps(self.view, ensure_ascii=False) if self.view else '\n[宝可梦对局] 当前没有你的活动对局。') + (
-            '\n只有 pokemon_battle 的真实结果能证明开局/选队/出招已执行。对手由 CB AI 操作，你不能替双方出招。'
+            '\n[对战角色] 你就是正在和用户对战的夏莉。p1/你方=用户，p2/我方=夏莉自己。'
+            '用“我的宝可梦”“我这招”“你这次换人”自然回应，不用旁观者口吻说“夏莉选择了”或“对手AI决定”。'
+            '只有 pokemon_battle 的真实结果能证明开局/选队/出招已执行。己方决策已经由战斗服务完成，你不能额外替任一方下指令，也不能虚构战果。'
+            '开局必须先展示环境供用户选择，不默认太晶环境。rules 阶段只能 configure/end/status，选定后才六选三。'
+            '双方固定50级。普通招式不能偷偷附加太晶、Mega、极巨化或Z招式；特殊动作必须用户本条消息明确要求。'
             '用户意图不明确先澄清。动作必须选择本轮视图的 action id；不按旧历史猜编号。'
-            '对战工具执行后用一句话解说即可，程序会附候选或战况。普通聊天/图鉴查询不调用出招。')
+            '对战工具执行后用一两句第一人称回应，程序会附完整候选或战况。终局会单独发送我的感想和真实结果，无需重复长篇总结。普通聊天/图鉴查询不调用出招。')
 
     async def execute(self, name, args):
         if not isinstance(args, dict): raise PokemonError('input', '工具参数必须是对象')
@@ -334,9 +379,9 @@ class PokemonTurn:
             if section not in ('basic','learnset'): raise PokemonError('input','不支持的详情分类')
             return await self.games.client.request('GET','/dex/'+args['category']+'/'+quote(identity),params={'section':section,'offset':offset})
         if name != 'pokemon_battle' or not self.games.settings.pokemon_battle_enabled: raise PokemonError('disabled','对战工具未启用')
-        if set(args) - {'action','selection','action_id'}: raise PokemonError('input','不支持的对战参数')
+        if set(args) - {'action','environment','selection','action_id'}: raise PokemonError('input','不支持的对战参数')
         action = args.get('action')
-        if action not in ('start','select','act','status','end'): raise PokemonError('input','对战操作无效')
+        if action not in ('start','configure','select','act','status','end'): raise PokemonError('input','对战操作无效')
         owner = self.games.owner(self.message)
         if action == 'status':
             self.is_status = True
@@ -375,14 +420,21 @@ class PokemonTurn:
             if action == 'start': data.update(id=identity, issuedAt=int(time.time()*1000)); path='/chat-battles'
             else:
                 data['revision'] = self.view['revision']
-                path='/chat-battles/'+identity+'/'+{'select':'select','act':'actions','end':'end'}[action]
+                path='/chat-battles/'+identity+'/'+{'configure':'configure','select':'select','act':'actions','end':'end'}[action]
+                if action == 'configure':
+                    environment=args.get('environment')
+                    if self.view.get('phase') != 'rules' or environment not in [e['id'] for e in self.view.get('environments',[])]: raise PokemonError('input','请选择当前提供的对战环境')
+                    data['environment']=environment
                 if action == 'select':
                     selected=args.get('selection')
                     if not isinstance(selected,list) or len(selected)!=3 or any(type(n) is not int or not 1<=n<=6 for n in selected) or len(set(selected))!=3: raise PokemonError('input','请选择三个不同编号（1～6）')
                     data['selection']=selected
                 if action == 'act':
                     action_id=args.get('action_id')
-                    if action_id not in [a['id'] for a in self.view.get('actions',[])]: raise PokemonError('input','请选择本轮提供的合法动作')
+                    choice=next((a for a in self.view.get('actions',[]) if a['id']==action_id),None)
+                    if not choice: raise PokemonError('input','请选择本轮提供的合法动作')
+                    if choice.get('special') and not explicitly_requests_special(self.message.command_content, choice['special']):
+                        raise PokemonError('input','特殊机制需要你明确指定；普通出招不会自动太晶化、Mega进化、极巨化或使用Z招式。')
                     data['actionId']=action_id
             row['pending']={'kind':action,'path':path,'data':data}
             self.games.capture(row); self.games.store.save(row)

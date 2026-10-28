@@ -54,17 +54,22 @@ class FakeCB:
         if path=='/chat-battles':
             if self.view and self.view['phase'] not in TERMINAL: raise PokemonError('busy',BUSY)
             self.owner=owner
-            self.view={'id':data['id'],'instanceId':self.instance,'phase':'selecting','revision':1,
+            self.view={'id':data['id'],'instanceId':self.instance,'phase':'rules','revision':1,
                        'expiresAt':int(time.time()*1000)+300000,'turn':0,'winner':None,'summary':'',
-                       'candidates':[{'slot':n,'name':'皮卡丘','level':80,'moves':['十万伏特']} for n in range(1,7)],
+                       'candidates':[], 'environment':None,
+                       'environments':[{'id':i,'label':label} for i,label in [('standard','普通'),('gen7','Mega / Z招式'),('gen8','极巨化'),('gen9','太晶化')]],
                        'team':[],'actions':[],'events':[]}
         elif data['revision'] != self.view['revision']: raise PokemonError('stale','stale')
+        elif path.endswith('/configure'):
+            self.view.update(phase='selecting',revision=2,environment={'id':data['environment'],'label':data['environment']},
+                candidates=[{'slot':n,'name':'皮卡丘','level':50,'types':['电'],'nature':'胆小','natureEffect':'速度↑10%、攻击↓10%',
+                    'item':'电气球','ability':'静电','teraType':'飞行','mechanics':['Z招式'],'moves':['十万伏特']} for n in range(1,7)])
         elif path.endswith('/select'):
-            self.view.update(phase='active',revision=2,candidates=[],turn=1,
+            self.view.update(phase='active',revision=3,candidates=[],turn=1,
                              team=[{'slot':1,'name':'皮卡丘','condition':'100/100','active':True}],
-                             actions=[{'id':'2-move-1','label':'第1招 十万伏特'}])
+                             actions=[{'id':'3-move-1','label':'第1招 十万伏特'}])
         elif path.endswith('/actions'):
-            self.view.update(revision=3,turn=2,actions=[{'id':'3-move-1','label':'第1招 十万伏特'}])
+            self.view.update(revision=4,turn=2,actions=[{'id':'4-move-1','label':'第1招 十万伏特'}])
             if self.end_on_move: self.finish()
         elif path.endswith('/end'): self.finish()
         self.ops[key]=copy.deepcopy(self.view)
@@ -74,7 +79,7 @@ class FakeCB:
         return copy.deepcopy(self.view)
 
     def finish(self, reason='你获胜了！'):
-        self.view.update(phase='ended',revision=self.view['revision']+1,summary='宝可梦对战结束：'+reason,actions=[])
+        self.view.update(phase='ended',winner='p1',revision=self.view['revision']+1,summary='宝可梦对战结束：'+reason,actions=[])
 
 
 class GameStateTests(unittest.IsolatedAsyncioTestCase):
@@ -97,6 +102,51 @@ class GameStateTests(unittest.IsolatedAsyncioTestCase):
     async def start(self):
         return await (await self.turn()).execute('pokemon_battle',{'action':'start'})
 
+    async def configure(self):
+        return await (await self.turn(replace(self.message,message_id='configure'))).execute('pokemon_battle',{'action':'configure','environment':'gen9'})
+
+    async def test_environment_selection_and_full_candidate_details(self):
+        v=await self.start()
+        self.assertEqual(v['phase'],'rules');self.assertFalse(v['candidates'])
+        menu=render_battle(v)
+        for label in ('Mega','Z招式','极巨化','太晶化'): self.assertIn(label,menu)
+        with self.assertRaises(PokemonError):
+            await (await self.turn()).execute('pokemon_battle',{'action':'configure','environment':'invalid'})
+        v=await self.configure();text=render_battle(v)
+        for info in ('Lv.50','属性：电','胆小','速度↑10%','攻击↓10%','电气球','静电','太晶属性：飞行','特殊机制：Z招式'): self.assertIn(info,text)
+
+    async def test_special_action_needs_explicit_current_message(self):
+        await self.start();await self.configure()
+        await (await self.turn(incoming(identity='select'))).execute('pokemon_battle',{'action':'select','selection':[1,2,3]})
+        for special,text in [('terastallize','太晶化用第一招'),('mega','Mega进化用第一招'),('max','极巨化用第一招'),('zmove','Z招式第一招')]:
+            self.client.view['actions']=[{'id':'special-1','label':text,'special':special}]
+            count=len(self.client.ops)
+            for content in ('第一招','不要'+text):
+                with self.assertRaises(PokemonError):
+                    await (await self.turn(incoming(identity='reject-'+special+content,text=content))).execute('pokemon_battle',{'action':'act','action_id':'special-1'})
+            self.assertEqual(len(self.client.ops),count)
+            await (await self.turn(incoming(identity='explicit-'+special,text=text))).execute('pokemon_battle',{'action':'act','action_id':'special-1'})
+            self.assertEqual(len(self.client.ops),count+1)
+
+    async def test_narrator_race_and_definite_rejection_reuses_closing(self):
+        self.games.narrator=AsyncMock(return_value='下次我可不会轻易认输啦！')
+        v=await self.start();self.client.finish();await self.games.refresh(self.games.store.get(v['id']))
+        self.transport.send_battle_notice.side_effect=BattleNoticeRejected('no context')
+        await asyncio.gather(self.games.notify(v['id']),self.games.notify(v['id']))
+        await self.games.refresh(self.games.store.get(v['id']))
+        await self.games.notify(v['id'],self.message)
+        self.games.narrator.assert_awaited_once()
+        self.assertIn('下次我可不会',self.transport.send_text.await_args.args[1])
+        self.assertIn('你获胜',self.transport.send_text.await_args.args[1])
+
+    async def test_timeout_narration_failure_keeps_non_result(self):
+        self.games.narrator=AsyncMock(side_effect=RuntimeError('offline'))
+        v=await self.start();self.client.view.update(phase='expired',winner=None,summary='超时中断，不判胜负。')
+        await self.games.refresh(self.games.store.get(v['id']));await self.games.notify(v['id'])
+        text=self.transport.send_battle_notice.await_args.args[1]
+        self.assertIn('不判胜负',text);self.assertIn('等了你好一会儿',text)
+        self.assertNotIn('赢',text);self.assertNotIn('获胜',text)
+
     async def test_cross_channel_busy_and_foreign_scope(self):
         await self.start()
         for message in (incoming('B'),incoming(conversation='another'),incoming(channel='wechat')):
@@ -114,20 +164,20 @@ class GameStateTests(unittest.IsolatedAsyncioTestCase):
         await recovered.tick()
         self.assertFalse(recovered.store.get(row['id'])['pending'])
         self.assertEqual(len(self.client.ops),1)
-        self.assertEqual(recovered.store.get(row['id'])['view']['phase'],'selecting')
+        self.assertEqual(recovered.store.get(row['id'])['view']['phase'],'rules')
 
     async def test_fixed_turn_precondition_and_one_mutation(self):
-        await self.start()
+        await self.start();await self.configure()
         turn=await self.turn(replace(self.message,message_id='message-2'))
         view=await turn.execute('pokemon_battle',{'action':'select','selection':[3,1,2]})
         self.assertEqual(view['phase'],'active')
         self.assertEqual(await turn.execute('pokemon_battle',{'action':'select','selection':[3,1,2]}),view)
-        with self.assertRaises(PokemonError): await turn.execute('pokemon_battle',{'action':'act','action_id':'2-move-1'})
+        with self.assertRaises(PokemonError): await turn.execute('pokemon_battle',{'action':'act','action_id':'3-move-1'})
         stale=await self.turn(replace(self.message,message_id='message-3'))
         self.client.view['revision']=9
         await stale.execute('pokemon_battle',{'action':'status'})
-        with self.assertRaises(PokemonError): await stale.execute('pokemon_battle',{'action':'act','action_id':'2-move-1'})
-        self.assertEqual(self.client.calls[-1][2]['revision'],2)
+        with self.assertRaises(PokemonError): await stale.execute('pokemon_battle',{'action':'act','action_id':'3-move-1'})
+        self.assertEqual(self.client.calls[-1][2]['revision'],3)
 
     async def test_terminal_notice_race_sends_once_to_origin(self):
         v=await self.start();self.client.finish();await self.games.refresh(self.games.store.get(v['id']))
@@ -208,7 +258,7 @@ class GameStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_context_expires_and_render_never_needs_model(self):
         v=await self.start();row=self.games.store.get(v['id']);row.update(context={'context_token':'secret'},context_until=time.time()-1);self.games.store.save(row)
         self.games.store.prune();self.assertEqual(self.games.store.get(v['id'])['context'],{})
-        self.assertIn('选三个',render_battle(v))
+        self.assertIn('对战环境',render_battle(v))
 
     async def test_watcher_only_checks_active_and_pending_records(self):
         v=await self.start()
@@ -219,7 +269,7 @@ class GameStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({r['id'] for r in self.games.store.due()},{v['id'],'history-3'})
         with patch.object(self.games.store,'all',side_effect=AssertionError('no full-history decode')):
             await self.games.tick()
-            self.assertEqual(self.games.store.get(v['id'])['view']['phase'],'selecting')
+            self.assertEqual(self.games.store.get(v['id'])['view']['phase'],'rules')
         self.transport.send_battle_notice.assert_awaited_once()
 
 
@@ -243,7 +293,14 @@ class BotGameTests(unittest.IsolatedAsyncioTestCase):
             raise LLMError('failed after successful tool')
         self.llm.complete_with_tools.side_effect=start
         await self.process(wx.message('来一场宝可梦对战',identity=10))
-        self.assertIn('正在准备',self.sent_text());self.assertIn('六只候选',self.sent_text())
+        self.assertIn('对战环境',self.sent_text());self.assertNotIn('六只候选',self.sent_text())
+        async def configure(system,prompt,tools,execute,**kwargs):
+            self.assertIn('rules',prompt)
+            await execute('pokemon_battle',{'action':'configure','environment':'gen9'})
+            return '来，选好你的队伍吧。'
+        self.llm.complete_with_tools.side_effect=configure
+        await self.process(wx.message('太晶化环境',identity=12))
+        self.assertIn('六只候选',self.sent_text());self.assertIn('速度↑10%',self.sent_text())
         self.assertEqual(self.sent_text().count('正在准备'),1)
         async def select(system,prompt,tools,execute,**kwargs):
             self.assertIn('selecting',prompt)
@@ -279,13 +336,13 @@ class BotGameTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_notice_and_background_tick_do_not_duplicate(self):
         self.enable()
-        actions=[{'action':'start'},{'action':'select','selection':[1,2,3]},{'action':'act','action_id':'2-move-1'}]
+        actions=[{'action':'start'},{'action':'configure','environment':'gen9'},{'action':'select','selection':[1,2,3]},{'action':'act','action_id':'3-move-1'}]
         async def controller(system,prompt,tools,execute,**kwargs):
             result=json.loads(await execute('pokemon_battle',actions.pop(0)))
             if result.get('phase')=='ended': await self.bot._pokemon.tick()
             return '解说'
         self.llm.complete_with_tools.side_effect=controller
-        await self.process(wx.message(identity=30));await self.process(wx.message('选123',identity=31))
+        await self.process(wx.message(identity=30));await self.process(wx.message('太晶',identity=33));await self.process(wx.message('选123',identity=31))
         self.cb.end_on_move=True
         await self.process(wx.message('第一招',identity=32))
         self.assertEqual(self.sent_text().count('宝可梦对战结束'),1)

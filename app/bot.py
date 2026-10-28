@@ -375,7 +375,7 @@ class PersonaBot:
         if settings.pokemon_dex_enabled or settings.pokemon_battle_enabled:
             self._pokemon = PokemonGames(settings, store,
                 PokemonClient(llm._session, settings.pokemon_service_url, settings.pokemon_service_token),
-                transport or QQTransport(qq))
+                transport or QQTransport(qq), narrator=self._pokemon_closing)
 
     @property
     def transport(self) -> Transport:
@@ -394,6 +394,18 @@ class PersonaBot:
     def start_games(self):
         if getattr(self, '_pokemon', None):
             self._pokemon.start()
+
+    async def _pokemon_closing(self, view):
+        persona = Path(self._settings.persona_path).read_text(encoding='utf-8').strip()
+        facts = {k: view.get(k) for k in ('phase', 'winner', 'reason', 'summary', 'turn', 'events', 'environment')}
+        raw = await self._llm.complete(persona + '\n你正在亲自与用户对战。p1是用户，p2是你（夏莉）。',
+            '这局已经结束。只写两句简短、自然、有夏莉个性的赛后感想，称自己为“我”，直接对用户说话。'
+            '可以不服输、开心或惋惜，避免机械播报和旁观解说；不得声称另一个AI替你下指令。'
+            '必须尊重下面的真实结果，超时/故障不能判胜负。不编造招式、属性、操作动机或逆转。'
+            '程序另附胜负、回合和战况，你不必重复列表、环境或具体数字。不加表情标记。\n'+json.dumps(facts,ensure_ascii=False),
+            model=self._settings.llm_model)
+        text, _ = extract_emote(raw, EMOTE_NAMES)
+        return self._redact_internal_reply(clean_reply(text,240,(self._settings.bot_name,*self._settings.bot_aliases)))
 
     async def start(self) -> None:
         self.start_games()
@@ -1046,7 +1058,7 @@ class PersonaBot:
                         raise WorkspaceError("渠道发送状态尚未确认，已停止本条消息后续工具操作。")
                     if name in {'pokemon_dex', 'pokemon_battle'} and name in allowed_tools and game_turn:
                         result = await game_turn.execute(name, arguments)
-                        if (name == 'pokemon_battle' and arguments.get('action') == 'start'
+                        if (name == 'pokemon_battle' and arguments.get('action') == 'configure'
                                 and result.get('phase') == 'selecting' and not game_preparation_sent):
                             game_preparation_sent = True
                             await self.transport.send_text(group_id, '正在准备对局…', message_id, sequence=next_sequence)
