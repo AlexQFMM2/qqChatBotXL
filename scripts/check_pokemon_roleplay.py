@@ -102,6 +102,7 @@ async def run_case(session, label, before, question, after=None, expected=None, 
         bot._pokemon=games
         message=IncomingMessage('qq','synthetic-roleplay-group','probe-'+label,'player','老师','member',question,question)
         row=games.store.create(before['id'],games.owner(message),message,before)
+        row['event_cursor']=max([e['id'] for e in before.get('events',[])] or [0]);games.store.save(row)
         if before['phase'] in TERMINAL:
             row['notice']='sent';games.store.save(row)
         try:
@@ -109,11 +110,11 @@ async def run_case(session, label, before, question, after=None, expected=None, 
                 await store.add(message.conversation_id,'bot','夏莉',text,is_bot=True)
             await asyncio.wait_for(bot.handle_message(message,_from_task_queue=True),120)
             assert sent, 'no reply'
-            assert client.mutations == (1 if after else 0), 'mutation count differs'
             # Preserve the generated prose while omitting automatic card blocks from the review log.
             reply=sent[-1].split('\n第 ')[0].split('\n环境：')[0].split('\n来，先选')[0]
             assert reply, 'empty commentary'
-            print(json.dumps({'case':label,'question':question,'reply':reply},ensure_ascii=False),flush=True)
+            print(json.dumps({'case':label,'question':question,'reply':reply,'mutations':client.mutations},ensure_ascii=False),flush=True)
+            assert client.mutations == (1 if after else 0), 'mutation count differs'
             if label=='postgame_origin':
                 closing=await asyncio.wait_for(bot._pokemon_closing(ENDED),40)
                 print(json.dumps({'case':'closing','reply':closing},ensure_ascii=False),flush=True)

@@ -181,6 +181,14 @@ class GameStateTests(unittest.IsolatedAsyncioTestCase):
         for msg in (incoming('B'),incoming(conversation='other'),incoming(channel='wechat')):
             self.assertNotIn('鬃岩狼人',recovered.turn(msg,await recovered.gate(msg)).prompt())
 
+    async def test_forfeit_facts_distinguish_fainted_and_remaining_members(self):
+        facts=battle_facts({'phase':'ended','winner':'p2','reason':'玩家认输',
+            'team':[{'name':'烈焰猴','condition':'0 fnt'},{'name':'水君','condition':'100/100'},
+                    {'name':'卡比兽','condition':'0/246'},{'name':'信息缺失'}]})
+        self.assertEqual(facts['result']['termination'],'human_forfeit')
+        self.assertEqual(facts['human_player']['fainted_pokemon'],['烈焰猴','卡比兽'])
+        self.assertEqual(facts['human_player']['remaining_pokemon'],['水君'])
+
     async def test_recent_result_never_replaces_new_current_game(self):
         v=await self.start();self.client.finish();await self.games.refresh(self.games.store.get(v['id']))
         msg=incoming(identity='new-game');turn=await self.turn(msg)

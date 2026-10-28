@@ -21,14 +21,14 @@ TERMINAL = {'ended', 'cancelled', 'expired', 'failed', 'interrupted'}
 
 BATTLE_ROLE_PROMPT = '''
 [宝可梦对战身份与事实规则]
-你本人（夏莉）就是正在与用户对战的训练家。pokemon_battle / CB AI 是你自己的对战能力，像其他工具一样由你调用；它完成的夏莉方出招、换人就是你的行动。自然说“我派出…”“我的…”，不要把自己写成旁观者或另一个AI的解说员。用户明确问实现时可如实解释工具。
+在宝可梦对战中，你本人（夏莉）就是与用户对战的训练家。pokemon_battle / CB AI 是你自己的对战能力，像其他工具一样由你调用；它完成的夏莉方出招、换人就是你的行动。自然说“我派出…”“我的…”，不要把自己写成旁观者或另一个AI的解说员。用户明确问实现时可如实解释工具。
 工具事实按角色命名：human_player 始终是当前用户/老师；assistant_player 始终是你本人/夏莉。human_player 的候选、队伍、招式只能称“你的”；assistant_player 的已公开宝可梦才能称“我的”。相同种族也按阵营区分，不能单凭名字判断归属。
 六只候选全部属于用户，用户选三只后，你另外独立随机三只，双方不共用六选三池。不能把用户未选的宝可梦当成自己的；不得捏造尚未公开的己方队伍。
 战斗工具负责同时落实用户指令和你的决策，act 只用于提交用户明确指定的合法动作，不能再额外替任何一方发指令。叙述仅以工具的最新公开事实为准，历史聊天中的口误和角色台词不是战斗事实。
-只回应已经发生的动作与结果。换人后尚未结算的攻击不能说成已经发生或必然发生；不要编造出招动机、下一招、属性克制/特性/伤害倍率。不确定的机制先查图鉴，证据不足就坦诚说明。
+对战过程的简短角色回应不做战术分析、不预测伤害或下一回合；用期待、较劲、惋惜等反应保持角色感。只有用户主动问机制/战术时才依据查询证据解释。只回应已经发生的动作与结果。换人后尚未结算的攻击不能说成已经发生或必然发生；不要编造出招动机、下一招、属性克制/特性/伤害倍率。不确定的机制先查图鉴，证据不足就坦诚说明。
 开局先让用户选择环境，再六选三。普通招式不得附加太晶、Mega、极巨化或Z，特殊动作需用户本条消息明确要求。普通聊天/图鉴/复盘不得调用出招。
 选环境、选队或出招后只写一两句简短自然的对手回应；不重复环境菜单、候选清单、队伍卡片、合法动作或整段战报，程序会附上。复盘时直接回答问题；发现先前归属说反就直接纠正，不要猜用户看漏、记错或没认出形态。
-已结束的最近一局仅供复盘，不是活动局。结果为中断时不判胜负。终局感想只能依据标明阵营的真实结果，不需要重复数字或列表。
+认输结束以result.termination为准，不得改写成被最后一招击倒或全队倒下；fainted_pokemon是已经倒下的玩家宝可梦，remaining_pokemon仍存活，不能附和用户的错误前提。已结束的最近一局仅供复盘，不是活动局。与宝可梦无关的话题正常聊天，不主动续谈已结束的对局。结果为中断时不判胜负。终局感想只能依据标明阵营的真实结果，不需要重复数字或列表。
 '''
 
 
@@ -164,11 +164,17 @@ def battle_facts(view, cursor=0):
     """Model-only, explicitly owned facts; never expose raw snapshots, local keys or character guesses."""
     if not view or 'phase' not in view: return view
     fields = ('phase', 'environment', 'environments', 'turn', 'expiresAt')
+    team = view.get('team', [])
+    fainted = lambda p: 'fnt' in p.get('condition', '') or bool(re.match(r'^0(?:/|$)', p.get('condition', '')))
+    termination = 'human_forfeit' if view.get('phase') == 'ended' and view.get('reason') == '玩家认输' else view.get('phase')
     events = [{'id': e['id'], 'text': neutral_battle_text(e['text'])} for e in view.get('events', [])]
     return {**{k: view.get(k) for k in fields},
         'human_player': {'identity': '当前用户/老师（对话中的你）',
                          'candidate_pool': view.get('playerCandidates') or view.get('candidates', []),
-                         'selected_team': view.get('team', []), 'legal_actions': view.get('actions', [])},
+                         'selected_team': team,
+                         'fainted_pokemon': [p['name'] for p in team if fainted(p)],
+                         'remaining_pokemon': [p['name'] for p in team if p.get('condition') and not fainted(p)],
+                         'legal_actions': view.get('actions', [])},
         'assistant_player': {'identity': '夏莉（正在回复的你本人，对话中的我）',
                              'team_source': '用户选好三只后，为夏莉独立随机三只，不来自用户的六候选',
                              'active_pokemon': view.get('opponent'),
@@ -176,7 +182,7 @@ def battle_facts(view, cursor=0):
         'team_selection_rule': '用户六选三；夏莉另外独立随机三只，双方不共用候选池',
         'public_events': events, 'new_public_events': [e for e in events if e['id'] > cursor],
         'events_truncated': bool(view.get('eventsTruncated')),
-        'result': {'winner': {'p1': 'human_player', 'p2': 'assistant_player'}.get(view.get('winner')),
+        'result': {'termination': termination, 'winner': {'p1': 'human_player', 'p2': 'assistant_player'}.get(view.get('winner')),
                    'reason': view.get('reason', ''), 'summary': neutral_battle_text(view.get('summary', ''))}}
 
 
