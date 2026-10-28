@@ -9,43 +9,6 @@ from unittest.mock import AsyncMock
 from app.bot import PersonaBot, _allowed_generated_image_url
 
 
-class ExplicitImageRequestTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.bot = PersonaBot.__new__(PersonaBot)
-        self.bot._settings = SimpleNamespace(bot_aliases=("夏莉", "Shirley"))
-
-    def test_accepts_explicit_natural_request(self) -> None:
-        self.assertEqual(
-            self.bot._explicit_image_prompt("夏莉，帮我生成一张图片 一只白猫"),
-            "一只白猫",
-        )
-        self.assertEqual(self.bot._explicit_image_prompt("画一张星空"), "星空")
-        self.assertEqual(
-            self.bot._explicit_image_prompt("可以，生成四格漫画"), "四格漫画"
-        )
-
-    def test_accepts_slash_command(self) -> None:
-        self.assertEqual(self.bot._explicit_image_prompt("/image watercolor fox"), "watercolor fox")
-
-    def test_does_not_trigger_on_capability_question(self) -> None:
-        self.assertIsNone(self.bot._explicit_image_prompt("你能生成图片吗？"))
-        self.assertIsNone(self.bot._explicit_image_prompt("生成一份 PDF 报告"))
-        self.assertIsNone(self.bot._explicit_image_prompt("生成一条语音"))
-
-    def test_accepts_self_and_chat_reference_requests(self) -> None:
-        self.assertEqual(
-            self.bot._explicit_image_prompt("以你自己为原型，画一张海边插画"),
-            "以你自己为原型，画一张海边插画",
-        )
-        self.assertEqual(
-            self.bot._explicit_image_prompt("参考刚才的图，把她画成水彩风格"),
-            "参考刚才的图，把她画成水彩风格",
-        )
-
-    def test_does_not_treat_reference_capability_question_as_request(self) -> None:
-        self.assertIsNone(self.bot._explicit_image_prompt("能不能参考这张图画画？"))
-
-
 class ImageEditReferenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_loads_curated_character_references(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -62,7 +25,7 @@ class ImageEditReferenceTests(unittest.IsolatedAsyncioTestCase):
             )
 
             images = await bot._image_edit_inputs(
-                "以你自己为原型，画一张海边插画", "group"
+                "self", "group"
             )
 
         self.assertEqual(len(images), 2)
@@ -86,7 +49,7 @@ class ImageEditReferenceTests(unittest.IsolatedAsyncioTestCase):
             )
 
             images = await bot._image_edit_inputs(
-                "以你自己为参考，人物长相服装与参考图完全一致，画一张三格漫画",
+                "self",
                 "group",
             )
 

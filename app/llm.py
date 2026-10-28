@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import logging
 import re
+import wave
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,13 +135,9 @@ class LLMClient:
         api_format: str | None = None,
         max_rounds: int = 10,
     ) -> str:
-        """Run an Anthropic-compatible tool loop.
-
-        OpenAI-compatible deployments still get normal chat replies; explicit slash
-        commands continue to provide file operations in that mode.
-        """
+        """Run the controller's tool loop in either supported API format."""
         effective_format = api_format or self._settings.llm_api_format
-        if effective_format != "anthropic" or not tools:
+        if not tools:
             return await self.complete(
                 system,
                 user_prompt,
@@ -146,6 +145,9 @@ class LLMClient:
                 images=images,
                 api_format=effective_format,
             )
+        if effective_format != "anthropic":
+            return await self._openai_with_tools(system, user_prompt, tools, execute_tool,
+                                                model=model, images=images, max_rounds=max_rounds)
 
         url = self._endpoint("messages")
         headers = {
@@ -267,6 +269,62 @@ class LLMClient:
             raise LLMError("工具调用达到上限后，模型没有返回任务总结")
         return final_text
 
+    async def _openai_with_tools(self, system, user_prompt, tools, execute_tool, *,
+                                 model, images, max_rounds):
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": _openai_user_content(user_prompt, images)},
+        ]
+        definitions = [{"type": "function", "function": {
+            "name": tool["name"], "description": tool["description"],
+            "parameters": tool["input_schema"],
+        }} for tool in tools]
+        headers = {"Authorization": f"Bearer {self._settings.llm_api_key}",
+                   "content-type": "application/json"}
+
+        async def request(with_tools):
+            payload = {"model": model or self._settings.llm_model,
+                       "max_tokens": self._settings.llm_max_tokens,
+                       "temperature": self._settings.llm_temperature, "messages": messages}
+            if with_tools:
+                payload["tools"] = definitions
+            data = await self._post(self._endpoint("chat/completions"), headers, payload)
+            try:
+                message = data["choices"][0]["message"]
+                if not isinstance(message, dict):
+                    raise TypeError()
+                return message
+            except (KeyError, IndexError, TypeError) as exc:
+                raise LLMError("工具调用响应格式不正确") from exc
+
+        for _ in range(max_rounds):
+            message = await request(True)
+            calls = message.get("tool_calls") or []
+            if not calls:
+                text = message.get("content")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+                break
+            # Preserve provider reasoning fields needed by some compatible models.
+            messages.append({**message, "role": "assistant"})
+            for call in calls:
+                try:
+                    function = call["function"]
+                    arguments = json.loads(function.get("arguments") or "{}")
+                    if not isinstance(arguments, dict):
+                        raise ValueError("工具参数必须为对象")
+                    result = await execute_tool(function["name"], arguments)
+                except Exception as exc:
+                    result = json.dumps({"error": str(exc)[:500]}, ensure_ascii=False)
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        messages.append({"role": "user", "content":
+            "不要再调用工具。根据已有结果回复已完成和未完成的内容；没有成功结果时不得声称成功。"})
+        final = await request(False)
+        text = final.get("content")
+        if not isinstance(text, str) or not text.strip():
+            raise LLMError("工具执行后模型没有返回最终文本")
+        return text.strip()
+
     def _recovery_max_tokens(self) -> int:
         return min(8192, max(1600, self._settings.llm_max_tokens * 2))
 
@@ -303,7 +361,11 @@ class LLMClient:
             "Authorization": f"Bearer {self._settings.llm_api_key}",
             "content-type": "application/json",
         }
-        data = await self._post(self._endpoint("chat/completions"), headers, payload)
+        endpoint = "chat/completions"
+        if getattr(self._settings, "media_route", "direct") == "fusion":
+            endpoint = "fusion/media"
+            payload = {"model": self._settings.llm_model, "operation": "draw", "prompt": prompt}
+        data = await self._post(self._endpoint(endpoint), headers, payload, timeout_seconds=170)
         image_url = _generated_image_url(data)
         if image_url is None:
             fields = ", ".join(sorted(str(key) for key in data))[:160]
@@ -320,12 +382,19 @@ class LLMClient:
         *,
         model: str,
         max_bytes: int,
+        audio_format: str = "silk",
     ) -> bytes:
         """Synthesize a short reply through the authenticated voice adapter."""
         value = text.strip()
         if not value:
             raise LLMError("语音文本不能为空")
+        if audio_format not in {"silk", "wav"}:
+            raise LLMError("不支持的语音输出格式")
         payload = {"model": model, "text": value}
+        if getattr(self._settings, "media_route", "direct") == "fusion":
+            payload["model"] = self._settings.llm_model
+        if audio_format != "silk":
+            payload["format"] = audio_format
         headers = {
             "Authorization": f"Bearer {self._settings.llm_api_key}",
             "content-type": "application/json",
@@ -360,8 +429,18 @@ class LLMClient:
             raise LLMError(f"语音适配接口连接失败：{exc}") from exc
         if not data or len(data) > max_bytes:
             raise LLMError("生成的语音为空或超过大小限制")
-        if not (data.startswith(b"#!SILK_V3") or data.startswith(b"\x02#!SILK_V3")):
-            raise LLMError("语音适配接口没有返回有效的 QQ SILK 音频")
+        if audio_format == "silk":
+            if not (data.startswith(b"#!SILK_V3") or data.startswith(b"\x02#!SILK_V3")):
+                raise LLMError("语音适配接口没有返回有效的 QQ SILK 音频")
+        else:
+            try:
+                with wave.open(io.BytesIO(data), "rb") as audio:
+                    frames = audio.getnframes()
+                    if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, 24000) \
+                            or frames <= 0 or len(audio.readframes(frames)) != frames * 2:
+                        raise ValueError
+            except (wave.Error, EOFError, ValueError):
+                raise LLMError("语音适配接口没有返回完整的 WAV 音频") from None
         return data
 
     async def edit_image(
@@ -389,7 +468,11 @@ class LLMClient:
             "Authorization": f"Bearer {self._settings.llm_api_key}",
             "content-type": "application/json",
         }
-        data = await self._post(self._endpoint("image-edits"), headers, payload)
+        endpoint = "image-edits"
+        if getattr(self._settings, "media_route", "direct") == "fusion":
+            endpoint = "fusion/media"
+            payload.update(model=self._settings.llm_model, operation="edit")
+        data = await self._post(self._endpoint(endpoint), headers, payload, timeout_seconds=170)
         image_url = _generated_image_url(data)
         if image_url is None:
             raise LLMError("图像编辑模型没有返回可下载的图片")
@@ -485,10 +568,13 @@ class LLMClient:
             return f"{base}/{suffix}"
         return f"{base}/v1/{suffix}"
 
-    async def _post(self, url: str, headers: dict, payload: dict) -> dict:
+    async def _post(self, url: str, headers: dict, payload: dict, *, timeout_seconds: int = 110) -> dict:
         try:
-            async with asyncio.timeout(110):
-                async with self._session.post(url, headers=headers, json=payload) as response:
+            # CCR media allows 150 s upstream; image requests must also override
+            # the shared session's 120 s default, while ordinary chat stays at 110 s.
+            async with asyncio.timeout(timeout_seconds):
+                async with self._session.post(url, headers=headers, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds, connect=15)) as response:
                     data = await response.json(content_type=None)
                     if response.status == 429:
                         raise LLMError("模型接口限流（HTTP 429），请稍后再试")

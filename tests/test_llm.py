@@ -297,3 +297,83 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenAIToolLoopTests(unittest.IsolatedAsyncioTestCase):
+    def client(self, responses):
+        from app.llm import LLMClient
+        settings = ToolLoopTests._settings()
+        settings.llm_api_format = 'openai'
+        client = LLMClient(settings, None)
+        # Snapshot requests because the messages list grows between rounds.
+        self.payloads = []
+        import copy
+        async def post(url, headers, payload):
+            self.payloads.append(copy.deepcopy(payload))
+            return {'choices':[{'message':responses.pop(0)}]}
+        client._post = post
+        return client
+
+    async def run_loop(self, client, execute, **kwargs):
+        return await client.complete_with_tools('system','draw',[{
+            'name':'generate_image','description':'draw',
+            'input_schema':{'type':'object','properties':{'prompt':{'type':'string'}}},
+        }],execute,**kwargs)
+
+    async def test_executes_openai_tool_call_and_returns_result_to_model(self):
+        client = self.client([
+            {'role':'assistant','content':None,'reasoning_content':'think','tool_calls':[
+                {'id':'call1','type':'function','function':{'name':'generate_image','arguments':'{"prompt":"cat"}'}}]},
+            {'content':'图片发送成功。'},
+        ])
+        execute = AsyncMock(return_value='{"status":"sent"}')
+        self.assertEqual(await self.run_loop(client,execute),'图片发送成功。')
+        execute.assert_awaited_once_with('generate_image',{'prompt':'cat'})
+        self.assertEqual(self.payloads[1]['messages'][-1]['role'],'tool')
+        self.assertEqual(self.payloads[1]['messages'][-1]['tool_call_id'],'call1')
+        self.assertEqual(self.payloads[1]['messages'][-2]['reasoning_content'],'think')
+
+    async def test_malformed_json_never_calls_executor(self):
+        client=self.client([{'tool_calls':[{'id':'1','function':{'name':'generate_image','arguments':'oops'}}]},
+                            {'content':'参数有误。'}])
+        execute=AsyncMock()
+        await self.run_loop(client,execute)
+        execute.assert_not_awaited()
+        self.assertIn('error',self.payloads[1]['messages'][-1]['content'])
+
+    async def test_failed_tool_is_returned_as_error_and_limit_stops_tools(self):
+        client=self.client([{'tool_calls':[{'id':'1','function':{'name':'generate_image','arguments':'{}'}}]},
+                            {'content':'没有完成。'}])
+        execute=AsyncMock(side_effect=RuntimeError('failed'))
+        await self.run_loop(client,execute,max_rounds=1)
+        self.assertNotIn('tools',self.payloads[-1])
+        self.assertIn('error',self.payloads[-1]['messages'][-2]['content'])
+
+    async def test_empty_reply_recovers_once_without_tools(self):
+        client=self.client([{'content':None},{'content':'重试文本'}])
+        execute=AsyncMock()
+        self.assertEqual(await self.run_loop(client,execute),'重试文本')
+        self.assertNotIn('tools',self.payloads[-1])
+        execute.assert_not_awaited()
+
+
+class MediaTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_requests_override_session_timeout_but_chat_keeps_default(self):
+        from unittest.mock import MagicMock
+        from app.llm import LLMClient
+        settings = ToolLoopTests._settings()
+        settings.media_route = 'fusion'
+        response = SimpleNamespace(status=200, json=AsyncMock(return_value={
+            'data':[{'url':'https://dashscope-test.aliyuncs.com/result.png'}],
+            'content':[{'type':'text','text':'你好'}],
+        }))
+        context = AsyncMock()
+        context.__aenter__.return_value = response
+        session = SimpleNamespace(post=MagicMock(return_value=context))
+        client = LLMClient(settings, session)
+        await client.generate_image('猫咪',model='configured')
+        self.assertEqual(session.post.call_args.kwargs['timeout'].total,170)
+        await client.edit_image('改图',model='configured',images=[ImageInput('image/png',b'png')])
+        self.assertEqual(session.post.call_args.kwargs['timeout'].total,170)
+        await client.complete('system','你好')
+        self.assertEqual(session.post.call_args.kwargs['timeout'].total,110)

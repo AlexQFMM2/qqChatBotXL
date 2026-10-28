@@ -1,12 +1,20 @@
 # 计划目录
 
-更新时间：2026-10-22（Asia/Shanghai）。各计划 README 的 `Status` 为状态唯一来源；本文件只负责索引。
+更新时间：2026-10-28（Asia/Shanghai）。各计划 README 的 `Status` 为状态唯一来源；本文件只负责索引。
+
+新会话先读 [夏莉项目交接入口](../README.md)：当前能力、已修复问题、验收证据、线上版本、版本管理状态及接手顺序。
 
 ## 进行中
 
 | 计划 | Owner | 更新时间 | 路径 |
 |---|---|---|---|
-| QQChat 微信私聊与共享长期记忆（双端已常驻，264 项应用测试及 4 项观察汇总测试通过；真实跨端已确认，实际 04:00 整理与 24 小时观察待完成；共享文件延期） | 当前执行者负责实现与集成；项目维护者负责扫码与用户验收 | 2026-10-22 | [交接记录](../wechat-private-chat/handoff.md) · [计划与方案取舍](../wechat-private-chat/README.md) · [任务](../wechat-private-chat/tasks.md) · [进度](../wechat-private-chat/taskList.md) |
+| QQChat 微信私聊与共享长期记忆（双端已常驻，最新时间修复 305 项应用测试；真实跨端与 10-23 实际整理已确认，24 小时观察从 10-23 15:01:45 重算；共享文件延期） | 当前执行者负责实现与集成；项目维护者负责扫码与用户验收 | 2026-10-23 | [交接记录](../wechat-private-chat/handoff.md) · [计划与方案取舍](../wechat-private-chat/README.md) · [任务](../wechat-private-chat/tasks.md) · [进度](../wechat-private-chat/taskList.md) |
+
+## 已完成
+
+| 计划 | Owner | 更新时间 | 路径 |
+|---|---|---|---|
+| Fusion 统一扩展配置与主模型工具调度（300 项回归、真实主控/自动夏莉参考预检和双端发布通过；用户确认微信头像图片收到、语音可播放） | Codex，单执行者串行 | 2026-10-23 | [计划](../fusion-media/README.md) · [任务](../fusion-media/tasks.md) · [进度](../fusion-media/taskList.md) |
 
 ## 既有单文件资料
 

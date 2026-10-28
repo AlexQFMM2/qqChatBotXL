@@ -30,7 +30,7 @@ from app.workspace import WorkspaceError
 ACCOUNT = {'token': 'fake-token', 'bot_id': 'bot', 'owner': 'trusted-owner',
            'base_url': 'https://ilinkai.weixin.qq.com'}
 ENV = {'LLM_BASE_URL': 'https://example.test', 'LLM_API_KEY': 'fake-model-key',
-       'LLM_MODEL': 'Fusion/qqchatbot', 'EMOTE_ENABLED': 'false', 'VISION_ROUTE': 'fusion'}
+       'LLM_MODEL': 'Fusion/qqchatbot', 'EMOTE_ENABLED': 'false', 'VISION_ROUTE': 'fusion', 'TASK_PROGRESS_ACK_ENABLED':'false'}
 
 
 def message(text='你好', identity=1, **overrides):
@@ -196,8 +196,9 @@ class WeChatCoreTests(unittest.IsolatedAsyncioTestCase):
         original=(Path(self.settings.emote_path)/'害羞.png').read_bytes()
         self.transport.media.download=AsyncMock(return_value=(original,'forwarded.png',2))
         forwarded=message(item_list=[text_item('看看这张图片'),{'type':2,'image_item':{}}])
+        self.use_tools(('understand_images', {'question':'描述图片'}))
         await self.process(forwarded)
-        images=self.llm.complete_with_tools.await_args.kwargs['images']
+        images=self.llm.complete.await_args.kwargs['images']
         self.assertEqual([image.data for image in images],[original])
         await self.process(forwarded)
         self.assertFalse(await self.runtime.process_one())
@@ -238,11 +239,98 @@ class WeChatCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transport.media.upload.await_args.args[0],b'common-tool-output')
         self.assertIn('文件已发出',self.sent_text())
 
-    async def test_image_reaches_existing_vision_path(self):
+    def use_tools(self, *calls, reply='完成。'):
+        async def complete(system, prompt, tools, execute, **kwargs):
+            self.assertEqual(kwargs['images'], [])  # The controller gets tools, not pre-read images.
+            for name, args in calls:
+                self.assertIn(name, {tool['name'] for tool in tools})
+                await execute(name, args)
+            return reply
+        self.llm.complete_with_tools.side_effect = complete
+
+    def fake_drawing(self):
+        self.bot._settings=replace(self.bot._settings,image_generation_enabled=True,
+            image_edit_enabled=True,image_text_overlay_enabled=False)
+        self.llm.generate_image=AsyncMock(return_value='https://dashscope-test.aliyuncs.com/result.png')
+        self.llm.edit_image=AsyncMock(return_value='https://dashscope-test.aliyuncs.com/result.png')
+        buf=io.BytesIO();Image.new('RGB',(4,4),'red').save(buf,format='PNG')
+        async def download(reference,target,maximum):target.write_bytes(buf.getvalue())
+        self.transport.download_attachment=AsyncMock(side_effect=download)
+        self.transport.media.upload=AsyncMock(return_value={'type':2,'image_item':{}})
+        return buf.getvalue()
+
+    async def test_image_is_read_only_when_controller_chooses_vision(self):
         buf=io.BytesIO(); Image.new('RGB',(4,4),'red').save(buf,format='PNG')
         self.transport.media.download=AsyncMock(return_value=(buf.getvalue(),'sample.png',2))
+        self.use_tools(('understand_images',{'question':'是什么颜色'}))
         await self.process(message(item_list=[text_item('是什么颜色'),{'type':2,'image_item':{}}]))
-        self.assertTrue(self.llm.complete_with_tools.await_args.kwargs['images'])
+        self.assertTrue(self.llm.complete.await_args.kwargs['images'])
+        self.llm.complete.reset_mock()
+        self.llm.complete_with_tools.side_effect=None
+        await self.process(message('今天心情很好',identity=2))
+        self.llm.complete.assert_not_awaited()
+
+    async def test_colloquial_drawing_calls_controller_then_generator_and_sends_image(self):
+        self.fake_drawing()
+        self.use_tools(('generate_image',{'prompt':'温暖治愈的水彩猫咪'}))
+        await self.process(message('那画个图安慰安慰上了一天班的我吧'))
+        self.llm.generate_image.assert_awaited_once()
+        self.llm.complete_with_tools.assert_awaited_once()
+        self.assertEqual(self.transport.media.upload.await_args.args[2],2)
+        self.assertEqual(self.store._db.execute('SELECT status FROM wx_inbox').fetchone()[0],'done')
+
+    async def test_explicit_voice_uses_controller_and_wav_in_wechat(self):
+        self.bot._settings=replace(self.settings,voice_enabled=True,voice_max_mb=5)
+        self.llm.generate_voice=AsyncMock(return_value=b'validated-wav-data')
+        self.transport.media.upload=AsyncMock(return_value={'type':4,'file_item':{}})
+        self.use_tools(('send_voice',{'text':'老师，辛苦啦'}))
+        await self.process(message('/voice 老师，辛苦啦'))
+        self.assertEqual(self.llm.generate_voice.await_args.kwargs['audio_format'],'wav')
+        upload=self.transport.media.upload.await_args
+        self.assertTrue(upload.args[1].endswith('.wav'))
+        self.assertEqual(upload.args[2],4)
+
+    async def test_retry_can_recall_only_current_users_requests_in_this_conversation(self):
+        self.fake_drawing()
+        group=self.transport.conversation_id
+        await self.store.add(group,ACCOUNT['owner'],'老师','画一幅治愈的猫咪图')
+        await self.store.add(group,'bot','夏莉','画一张机器人想象',is_bot=True)
+        await self.store.add(group,'other-user','访客','画别人的私人照片')
+        await self.store.add('other-conversation',ACCOUNT['owner'],'老师','画其他会话的图')
+        async def complete(system,prompt,tools,execute,**kwargs):
+            past=await execute('recent_requests',{})
+            self.assertIn('治愈的猫咪图',past)
+            for private in ('机器人想象','私人照片','其他会话的图'):
+                self.assertNotIn(private,past)
+            await execute('generate_image',{'prompt':'一幅治愈的猫咪图'})
+            return '图片已发出。'
+        self.llm.complete_with_tools.side_effect=complete
+        for identity,text in enumerate(('昨晚没画成的图，再试试看','再试试昨晚没成功的画图','那张图再来一次'),start=1):
+            await self.process(message(text,identity=identity))
+            self.assertEqual(self.llm.generate_image.await_count,identity)
+
+    async def test_no_media_side_effect_without_controller_tool_call(self):
+        self.fake_drawing()
+        for identity,text in enumerate(('画一张猫咪','别再画昨晚的图了','能画图吗','/image 猫咪'),start=1):
+            await self.process(message(text,identity=identity))
+        self.llm.generate_image.assert_not_awaited()
+        self.transport.media.upload.assert_not_awaited()
+        self.assertEqual(self.llm.complete_with_tools.await_count,4)
+
+    async def test_voice_failure_is_returned_to_controller_and_not_reexecuted(self):
+        self.bot._settings=replace(self.settings,voice_enabled=True)
+        self.llm.generate_voice=AsyncMock(side_effect=LLMError('safe failure'))
+        self.transport.media.upload=AsyncMock()
+        async def complete(system,prompt,tools,execute,**kwargs):
+            for _ in range(2):
+                with self.assertRaisesRegex(WorkspaceError,'未完成'):
+                    await execute('send_voice',{'text':'老师辛苦了'})
+            return '语音生成失败，先用文字回复。'
+        self.llm.complete_with_tools.side_effect=complete
+        await self.process(message('请用语音回复我'))
+        self.assertIn('语音生成失败',self.sent_text())
+        self.llm.generate_voice.assert_awaited_once()
+        self.transport.media.upload.assert_not_awaited()
 
     async def test_followup_phrase_reuses_saved_image_after_failed_first_attempt(self):
         buf=io.BytesIO(); Image.new('RGB',(4,4),'red').save(buf,format='PNG')
@@ -250,30 +338,36 @@ class WeChatCoreTests(unittest.IsolatedAsyncioTestCase):
         self.transport.media.download=AsyncMock(return_value=(original,'sample.png',2))
         self.llm.complete_with_tools.side_effect=LLMError('模型接口 HTTP 502: upstream failure')
         await self.process(message(item_list=[{'type':2,'image_item':{}}]))
-        self.llm.complete_with_tools.side_effect=None
-        self.llm.complete_with_tools.reset_mock()
+        self.use_tools(('understand_images',{'question':'再看刚才的图片'}))
         await self.process(message('再看刚才那张图片',identity=2))
-        self.llm.complete_with_tools.assert_awaited_once()
-        call=self.llm.complete_with_tools.await_args
-        self.assertEqual([im.data for im in call.kwargs['images']],[original])
-        self.assertIn('本次请求附带 1 张',call.args[1])
+        self.assertEqual([im.data for im in self.llm.complete.await_args.kwargs['images']],[original])
         self.transport.media.download.assert_awaited_once()
 
     async def test_explicit_followup_without_saved_image_cannot_invent_one(self):
+        async def complete(system,prompt,tools,execute,**kwargs):
+            with self.assertRaisesRegex(WorkspaceError,'没有找到可用图片'):
+                await execute('understand_images',{'question':'看图片'})
+            return '没有找到图片。'
+        self.llm.complete_with_tools.side_effect=complete
         await self.process(message('再看刚才那张图片'))
-        call=self.llm.complete_with_tools.await_args
-        self.assertEqual(call.kwargs['images'],[])
-        self.assertIn('没有找到可用图片',call.args[1])
+        self.llm.complete.assert_not_awaited()
+        self.assertIn('没有找到图片',self.sent_text())
 
-    async def test_photo_followup_is_scoped_to_this_conversation(self):
+    async def test_photo_followup_reset_cannot_reuse_old_image(self):
         buf=io.BytesIO(); Image.new('RGB',(4,4),'red').save(buf,format='PNG')
         self.transport.media.download=AsyncMock(return_value=(buf.getvalue(),'photo.png',2))
+        self.use_tools(('understand_images',{'question':'图片是什么颜色'}))
         await self.process(message(item_list=[{'type':2,'image_item':{}}]))
         await self.process(message('看看那张照片是什么颜色',identity=2))
-        self.assertEqual(len(self.llm.complete_with_tools.await_args.kwargs['images']),1)
+        self.assertEqual(self.llm.complete.await_count,2)
         await self.process(message('/reset',identity=3))
+        async def complete(system,prompt,tools,execute,**kwargs):
+            with self.assertRaisesRegex(WorkspaceError,'没有找到可用图片'):
+                await execute('understand_images',{'question':'看旧图'})
+            return '没有找到图片。'
+        self.llm.complete_with_tools.side_effect=complete
         await self.process(message('再看刚才那张图片',identity=4))
-        self.assertEqual(self.llm.complete_with_tools.await_args.kwargs['images'],[])
+        self.assertEqual(self.llm.complete.await_count,2)
 
     async def test_attachment_download_failure_is_not_reported_as_seen(self):
         self.transport.media.download=AsyncMock(side_effect=ProtocolError('safe-failure'))
@@ -368,6 +462,16 @@ class WeChatCoreTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EntrySettingsTests(unittest.TestCase):
+    def test_wechat_voice_opt_in_is_file_based_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state=State(Path(directory))
+            with patch.dict(os.environ,{**ENV,'VOICE_ENABLED':'true'},clear=True):
+                self.assertFalse(chat_settings(state,ACCOUNT).voice_enabled)
+            with patch.dict(os.environ,{**ENV,'WECHAT_VOICE_ENABLED':'true','VOICE_MAX_MB':'8'},clear=True):
+                settings=chat_settings(state,ACCOUNT)
+                self.assertTrue(settings.voice_enabled)
+                self.assertEqual(settings.voice_max_mb,5)
+
     def test_failure_details_expose_status_without_provider_body(self):
         error=RuntimeError('wrapper-with-private-content')
         error.__cause__=LLMError('模型接口 HTTP 400: secret-key private-image-data')

@@ -5,9 +5,11 @@ import base64
 import binascii
 import hashlib
 import hmac
+import io
 import logging
 import os
 import re
+import wave
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,8 @@ class Settings:
     max_text_chars: int
     max_audio_bytes: int
     request_timeout_seconds: int
+    fusion_base_url: str = ""
+    fusion_api_key: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,10 +71,20 @@ class Settings:
             ):
                 raise ValueError(f"{name} must be a public HTTPS URL")
         prefix = os.getenv("VOICE_PREFIX", "shirley").strip().lower()
+        fusion_base_url = os.getenv("FUSION_BASE_URL", "").strip().rstrip("/")
+        if fusion_base_url:
+            parsed = urlsplit(fusion_base_url)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment or not (
+                parsed.scheme == "https" and parsed.hostname or
+                parsed.scheme == "http" and parsed.hostname == "mymodels" and parsed.port in {3456, 8080}
+            ):
+                raise ValueError("FUSION_BASE_URL must be HTTPS or the internal CCR service")
         if not re.fullmatch(r"[a-z][a-z0-9]{2,15}", prefix):
             raise ValueError("VOICE_PREFIX must be 3-16 lowercase letters or digits")
         return cls(
             client_api_key=required("ADAPTER_CLIENT_KEY"),
+            fusion_base_url=fusion_base_url,
+            fusion_api_key=required("FUSION_API_KEY") if fusion_base_url else "",
             dashscope_api_key=required("DASHSCOPE_API_KEY"),
             dashscope_native_url=native_url,
             public_base_url=public_base_url,
@@ -402,10 +416,32 @@ class VoiceService:
             LOGGER.info("voice enrollment completed")
             return voice_id
 
-    async def synthesize(self, text: str) -> bytes:
-        voice_id = await self.ensure_voice()
-        payload = build_speech_payload(text, voice_id, self.settings)
-        data = await self._post_json(self.settings.dashscope_native_url, payload)
+    async def synthesize(self, text: str, *, audio_format: str = "silk", fusion_model: str | None = None) -> bytes:
+        if audio_format not in {"silk", "wav"}:
+            raise AdapterError("unsupported audio format")
+        if fusion_model:
+            if not self.settings.fusion_base_url or not fusion_model.startswith("Fusion/"):
+                raise AdapterError("Fusion voice route is not configured")
+            try:
+                async with self.session.post(
+                    self.settings.fusion_base_url + "/fusion/media",
+                    headers={"Authorization": "Bearer " + self.settings.fusion_api_key},
+                    json={"model": fusion_model, "operation": "speech", "text": text},
+                    allow_redirects=False,
+                ) as response:
+                    raw = await _read_limited(response.content, self.settings.max_audio_bytes * 2)
+                    if response.status != 200:
+                        raise AdapterError(f"CCR voice model request failed (HTTP {response.status}); check Fusion model and voice", 502)
+                    import json
+                    data = json.loads(raw)
+            except AdapterError:
+                raise
+            except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                raise AdapterError("CCR voice request failed or returned invalid data", 502) from exc
+        else:
+            voice_id = await self.ensure_voice()
+            payload = build_speech_payload(text, voice_id, self.settings)
+            data = await self._post_json(self.settings.dashscope_native_url, payload)
         audio_url, embedded = extract_audio_result(data, self.settings.max_audio_bytes)
         spoken_units = len(re.findall(r"[\w\u3400-\u9fff]", text))
         minimum_duration_ms = min(1800, max(180, spoken_units * 70))
@@ -438,17 +474,27 @@ class VoiceService:
             pcm = await _decode_to_pcm(audio)
         if len(pcm) * 1000 // (24000 * 2) < minimum_duration_ms:
             raise AdapterError("generated audio is implausibly short", 502)
-        silk = await asyncio.to_thread(_encode_silk_sync, pcm)
-        if len(silk) > self.settings.max_audio_bytes:
-            raise AdapterError("encoded SILK exceeds size limit", 502)
+        if audio_format == "wav":
+            buffer = io.BytesIO()
+            with wave.open(buffer, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(24000)
+                wav.writeframes(pcm)
+            encoded = buffer.getvalue()
+        else:
+            encoded = await asyncio.to_thread(_encode_silk_sync, pcm)
+        if len(encoded) > self.settings.max_audio_bytes:
+            raise AdapterError("encoded audio exceeds size limit", 502)
         LOGGER.info(
-            "voice audio prepared: source=%d bytes, pcm=%d bytes, silk=%d bytes, duration=%d ms",
+            "voice audio prepared: source=%d bytes, pcm=%d bytes, encoded=%d bytes, duration=%d ms, format=%s",
             len(audio),
             len(pcm),
-            len(silk),
+            len(encoded),
             len(pcm) * 1000 // (24000 * 2),
+            audio_format,
         )
-        return silk
+        return encoded
 
 
 async def health(request: web.Request) -> web.Response:
@@ -489,7 +535,9 @@ async def voice_speech(request: web.Request) -> web.Response:
         raise AdapterError("request body must be valid JSON") from exc
     if not isinstance(body, dict):
         raise AdapterError("JSON body must be an object")
-    if str(body.get("model", "")).strip() != settings.voice_model:
+    model = str(body.get("model", "")).strip()
+    is_fusion = model.startswith("Fusion/") and bool(settings.fusion_base_url)
+    if not is_fusion and model != settings.voice_model:
         raise AdapterError("voice model is not allowed")
     text = str(body.get("text", "")).strip()
     if not text or len(text) > settings.max_text_chars:
@@ -497,10 +545,16 @@ async def voice_speech(request: web.Request) -> web.Response:
             f"text is required and must not exceed {settings.max_text_chars} characters"
         )
     service: VoiceService = request.app["voice_service"]
-    silk = await service.synthesize(text)
+    audio_format = body.get("format", "silk")
+    if audio_format not in ("silk", "wav"):
+        raise AdapterError("unsupported audio format")
+    kwargs = {"audio_format": audio_format}
+    if is_fusion:
+        kwargs["fusion_model"] = model
+    audio = await service.synthesize(text, **kwargs)
     return web.Response(
-        body=silk,
-        content_type="application/octet-stream",
+        body=audio,
+        content_type="audio/wav" if audio_format == "wav" else "application/octet-stream",
         headers={"Cache-Control": "no-store"},
     )
 

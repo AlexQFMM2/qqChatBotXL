@@ -3,9 +3,11 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 
 EMOTE_NAMES = (
@@ -41,6 +43,7 @@ _MODEL_IMAGE_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _MENTION_RE = re.compile(r"<@!?([^>]+)>")
+CHAT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +52,32 @@ class ChatLine:
     content: str
     is_bot: bool = False
     user_id: str = ""
+    created_at: int | None = None
+
+
+def format_chat_timestamp(timestamp: int | None) -> str:
+    if timestamp is None:
+        return "记录时间未知"
+    return datetime.fromtimestamp(timestamp, CHAT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S +08:00")
+
+
+def build_time_context(now: datetime | None = None) -> str:
+    """Anchor each controller turn to the runtime clock, independent of host TZ."""
+    current = (now or datetime.now(CHAT_TIMEZONE)).astimezone(CHAT_TIMEZONE)
+    yesterday = current.date() - timedelta(days=1)
+    tomorrow = current.date() + timedelta(days=1)
+    weekday = "一二三四五六日"[current.weekday()]
+    return (
+        "\n\n## 当前时间（系统提供，优先于历史对话和角色背景）\n"
+        f"北京时间（Asia/Shanghai，UTC+08:00）：{current:%Y-%m-%d %H:%M:%S}，星期{weekday}。\n"
+        f"今天是 {current:%Y-%m-%d}；昨天是 {yesterday}；明天是 {tomorrow}。\n"
+        "这是本轮开始生成回复时的现实时间。聊天记录前的时间是系统记录时间，"
+        "不是此刻，也不保证是用户原始发送时间。历史消息、旧回复和长期记忆里的"
+        "‘今天、昨天、昨晚、明天’应结合各自记录或来源日期理解，不能直接套用到现在；"
+        "来源日期不足时不要编造具体时间。跨日或间隔较久后，不要沿用上次的夜晚、"
+        "问候或活动状态，也不要把旧事说成刚刚发生。用户回顾昨晚时可以正常回顾，"
+        "但不代表现在仍是晚上。自然回应即可，无需每次报时或解释这些规则。"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,7 +380,7 @@ def build_user_prompt(
             speaker = f"{owner_title}（你唯一绑定的开发者，{verification}）"
         else:
             speaker = line.username
-        transcript.append(f"{speaker}: {visible_content}")
+        transcript.append(f"[{format_chat_timestamp(line.created_at)}] {speaker}: {visible_content}")
     relationship_note = ""
     if line_list and line_list[-1].user_id in owners:
         relationship_note = (

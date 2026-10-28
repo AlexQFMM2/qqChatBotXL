@@ -9,7 +9,7 @@ import aiohttp
 from ..channel import IncomingMessage, TransportError
 from ..domain import AttachmentRef
 from .client import ProtocolError, SessionExpired, text_item
-from .media import MAX_MEDIA, Media, safe_filename
+from .media import MAX_MEDIA, Media, fit_generated_image, safe_filename
 from .state import atomic_write
 
 
@@ -130,15 +130,20 @@ class WeChatTransport:
 
     async def send_file(self, conversation, path: Path, message_id, *, sequence=1):
         self._check_destination(conversation, message_id)
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_MEDIA:
+        kind = 2 if path.suffix.lower() in {'.png','.jpg','.jpeg','.gif','.webp'} else 4
+        read_limit = 20 * 1024 * 1024 if kind == 2 else MAX_MEDIA
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > read_limit:
             raise TransportError('文件不存在、不是普通文件或超过当前微信 5 MiB 上限。')
         def read_bounded():
             with path.open('rb') as stream:
-                return stream.read(MAX_MEDIA + 1)
+                return stream.read(read_limit + 1)
         data = await asyncio.to_thread(read_bounded)
-        kind = 2 if path.suffix.lower() in {'.png','.jpg','.jpeg','.gif','.webp'} else 4
         try:
-            item = await self.media.upload(data, path.name, kind, self.account['owner'])
+            name = path.name
+            if kind == 2 and len(data) > MAX_MEDIA:
+                data = await asyncio.to_thread(fit_generated_image, data)
+                name = path.stem + '.png'
+            item = await self.media.upload(data, name, kind, self.account['owner'])
             return await self._send(conversation, message_id, item)
         except SessionExpired:
             self.expired = True
@@ -166,7 +171,10 @@ class WeChatTransport:
                     timeout=aiohttp.ClientTimeout(total=60)) as response:
                 if response.status != 200:
                     raise TransportError('生成图片下载失败。')
-                data = await limited_body(response, min(MAX_MEDIA, max_bytes))
+                # The source image may exceed the final workspace/upload quota.
+                # Keep its separate download cap, then enforce the final cap after resizing.
+                data = await limited_body(response, 20 * 1024 * 1024)
+            data = await asyncio.to_thread(fit_generated_image, data, min(MAX_MEDIA, max_bytes))
             atomic_write(target, data)
             return len(data)
         except SessionExpired:

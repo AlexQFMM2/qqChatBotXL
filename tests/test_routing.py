@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
-from app.bot import PersonaBot, TaskIntent, _references_image, _sha256_file
+from app.bot import PersonaBot, TaskIntent, _sha256_file
 from app.domain import AttachmentRef
 from app.llm import ImageInput
 from app.storage import MemoryStore
@@ -81,46 +81,36 @@ class ControllerIntentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bot = PersonaBot.__new__(PersonaBot)
         self.bot._settings = SimpleNamespace(
-            bot_aliases=("夏莉",), agent_access="admins", owner_user_ids=frozenset()
+            bot_aliases=("夏莉",), agent_access="admins", owner_user_ids=frozenset(),
+            vision_enabled=True, image_generation_enabled=True, image_edit_enabled=True, voice_enabled=True
         )
         self.bot._web_tools = object()
 
-    def test_only_bound_work_is_queued(self) -> None:
-        self.assertEqual(
-            self.bot._task_intent("我喜欢你", image_prompt=None, voice_requested=False),
-            TaskIntent.CHAT,
-        )
-        prompt = self.bot._explicit_image_prompt("可以，生成四格漫画")
-        self.assertEqual(
-            self.bot._task_intent("可以，生成四格漫画", image_prompt=prompt, voice_requested=False),
-            TaskIntent.IMAGE,
-        )
-        self.assertEqual(
-            self.bot._task_intent("查资料：夏莉出自哪部作品", image_prompt=None, voice_requested=False),
-            TaskIntent.SEARCH,
-        )
+    def test_natural_media_does_not_choose_execution_before_controller(self):
+        for text in ("我喜欢你", "可以，生成四格漫画", "再试试昨晚没成功的画图", "用语音回复我"):
+            self.assertEqual(self.bot._task_intent(text), TaskIntent.CHAT)
 
-    def test_prefetched_fact_query_does_not_expose_search_tools_again(self) -> None:
-        tools = self.bot._tools_for_request(
-            fact_check_requested=True,
-            role="member",
-            task_intent=TaskIntent.SEARCH,
-        )
-        self.assertEqual(tools, [])
+    def test_search_hints_still_expose_tools_for_controller(self):
+        tools = self.bot._tools_for_request(role="member", task_intent=TaskIntent.SEARCH)
+        names = {t["name"] for t in tools}
+        self.assertIn("research", names)
+        self.assertIn("understand_images", names)
+        self.assertNotIn("generate_image", names)
+        self.assertNotIn("write_file", names)
 
-    def test_latest_work_is_forced_into_research(self) -> None:
-        self.assertEqual(
-            self.bot._task_intent(
-                "柚子社最新作是什么", image_prompt=None, voice_requested=False
-            ),
-            TaskIntent.SEARCH,
-        )
+    def test_owner_identity_not_nickname_gets_media_tools(self):
+        self.bot._settings.owner_user_ids = frozenset({"real-owner"})
+        names = lambda uid: {t["name"] for t in self.bot._tools_for_request(role="member", user_id=uid)}
+        self.assertIn("generate_image", names("real-owner"))
+        self.assertIn("send_voice", names("real-owner"))
+        self.assertNotIn("generate_image", names("老师"))
 
-    def test_vision_requires_explicit_image_reference(self) -> None:
-        self.assertTrue(_references_image("帮我看下这个图片"))
-        self.assertTrue(_references_image("识别一下刚才的图"))
-        self.assertFalse(_references_image("柚子社最新作是什么"))
-        self.assertFalse(_references_image("生成一张图片"))
+    def test_disabled_tools_not_advertised(self):
+        self.bot._settings.image_generation_enabled = False
+        self.bot._settings.voice_enabled = False
+        self.bot._settings.vision_enabled = False
+        names = {t["name"] for t in self.bot._tools_for_request(role="owner")}
+        self.assertFalse(names & {"generate_image", "send_voice", "understand_images"})
 
 
 class VisionBackendRoutingTests(unittest.IsolatedAsyncioTestCase):

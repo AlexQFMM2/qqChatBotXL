@@ -142,8 +142,9 @@ services:
         max-file: "3"
 
   qwen-voice-adapter:
+    image: ${QQCHAT_VOICE_IMAGE:-qqchat-qwen-voice-adapter}
     build:
-      context: ./voice_adapter
+      context: ${QQCHAT_VOICE_BUILD_CONTEXT:-./voice_adapter}
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-mirror.ccs.tencentyun.com/library/python:3.12-slim}
     container_name: qwen-voice-adapter

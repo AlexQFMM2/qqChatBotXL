@@ -74,7 +74,6 @@ class BilibiliRoutingTests(unittest.TestCase):
         bot._web_tools = MagicMock()
         self.assertEqual(
             bot._tools_for_request(
-                fact_check_requested=False,
                 role="member",
                 task_intent=TaskIntent.BILIBILI,
             ),

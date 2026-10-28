@@ -12,7 +12,7 @@ class TaskProgressTests(unittest.TestCase):
         self.assertEqual(_task_eta("帮我查一下上海天气"), "1 分钟内")
         self.assertEqual(_task_eta("帮我写一份简单说明"), "1～3 分钟")
         self.assertEqual(_task_eta("整理成一份完整的 PDF 报告"), "2～5 分钟")
-        self.assertEqual(_task_eta("请用语音回复我"), "1～3 分钟")
+        self.assertIsNone(_task_eta("请用语音回复我"))  # Progress starts only when the model selects speech.
 
     def test_does_not_ack_chat_or_capability_questions(self) -> None:
         self.assertIsNone(_task_eta("我喜欢你"))

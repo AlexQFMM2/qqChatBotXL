@@ -177,7 +177,7 @@ class MemoryStore:
         async with self._lock:
             rows = self._db.execute(
                 """
-                SELECT user_id, username, content, is_bot, event, refs
+                SELECT user_id, username, content, is_bot, event, refs, chat_messages.created_at
                 FROM chat_messages LEFT JOIN memory_context ON memory_context.message=chat_messages.id
                 WHERE group_id = ?
                 ORDER BY id DESC
@@ -188,7 +188,7 @@ class MemoryStore:
         if self.memory_service is not None:
             rows = self.memory_service.filter_history(rows)
         return [
-            ChatLine(row[1], row[2], bool(row[3]), str(row[0]))
+            ChatLine(row[1], row[2], bool(row[3]), str(row[0]), created_at=int(row[6]))
             for row in reversed(rows)
         ]
 

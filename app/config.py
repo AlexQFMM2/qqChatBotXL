@@ -77,6 +77,7 @@ class Settings:
     emote_enabled: bool
     emote_path: str
     voice_enabled: bool
+    media_route: str
     voice_model: str
     voice_max_chars: int
     voice_max_mb: int
@@ -151,6 +152,9 @@ class Settings:
             raise ValueError("VISION_API_FORMAT 只能留空、anthropic 或 openai")
 
         vision_route = os.getenv("VISION_ROUTE", "direct").strip().lower()
+        media_route = os.getenv("MEDIA_ROUTE", "direct").strip().lower()
+        if media_route not in {"direct", "fusion"}:
+            raise ValueError("MEDIA_ROUTE 必须是 direct 或 fusion")
         if vision_route not in {"direct", "fusion"}:
             raise ValueError("VISION_ROUTE 只能是 direct 或 fusion")
 
@@ -254,6 +258,7 @@ class Settings:
             emote_path=os.getenv("EMOTE_PATH", "/app/emotes").strip()
             or "/app/emotes",
             voice_enabled=_bool("VOICE_ENABLED", False),
+            media_route=media_route,
             voice_model=os.getenv(
                 "VOICE_MODEL", "qwen3-tts-vc-2026-01-22"
             ).strip()

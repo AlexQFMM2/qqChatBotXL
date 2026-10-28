@@ -71,6 +71,23 @@ def verify_image(data):
         raise ProtocolError("图片无效、格式不支持或像素超过诊断上限。") from None
 
 
+def fit_generated_image(data: bytes, max_bytes: int = MAX_MEDIA) -> bytes:
+    """Bound generated image uploads without relaxing inbound/file limits."""
+    verify_image(data)
+    if len(data) <= max_bytes:
+        return data
+    with Image.open(io.BytesIO(data)) as original:
+        picture = original.convert('RGB')
+    for side in (1600, 1280, 1024, 800, 640, 480, 320):
+        picture.thumbnail((side, side), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        picture.save(output, format='PNG', optimize=True)
+        result = output.getvalue()
+        if len(result) <= max_bytes:
+            return result
+    raise ProtocolError('图片压缩后仍超过微信大小限制。')
+
+
 class Media:
     def __init__(self, client):
         self.client = client
