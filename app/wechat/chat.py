@@ -165,7 +165,8 @@ class ChatRuntime:
         except Exception as exc:
             # Never print provider payloads, message bodies, context tokens or keys.
             LOGGER.warning('微信本条处理未完成：%s', failure_details(exc))
-            if not self.transport.uncertain and not self.transport.expired and not getattr(exc, 'notified', False):
+            if (not self.transport.uncertain and not self.transport.expired
+                    and not getattr(exc, 'notified', False) and not getattr(exc, 'suppress_notification', False)):
                 try:
                     await self.transport.send_text(self.transport.conversation_id,
                         '这次处理没有完成。可以用 /files 查看已经保存的文件，再重新发起请求。', identity)

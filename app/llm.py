@@ -24,6 +24,13 @@ class LLMError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class FinalToolReply:
+    """A validated reply owned by the application; no further model/tools are needed."""
+
+    text: str
+
+
 class VisionInputError(ValueError):
     pass
 
@@ -128,7 +135,7 @@ class LLMClient:
         system: str,
         user_prompt: str,
         tools: list[dict],
-        execute_tool: Callable[[str, dict], Awaitable[str]],
+        execute_tool: Callable[[str, dict], Awaitable[str | FinalToolReply]],
         *,
         model: str | None = None,
         images: Sequence[ImageInput] = (),
@@ -220,6 +227,8 @@ class LLMClient:
                 arguments = call.get("input") if isinstance(call.get("input"), dict) else {}
                 try:
                     result = await execute_tool(name, arguments)
+                    if isinstance(result, FinalToolReply):
+                        return result.text
                     results.append(
                         {
                             "type": "tool_result",
@@ -314,6 +323,8 @@ class LLMClient:
                     if not isinstance(arguments, dict):
                         raise ValueError("工具参数必须为对象")
                     result = await execute_tool(function["name"], arguments)
+                    if isinstance(result, FinalToolReply):
+                        return result.text
                 except Exception as exc:
                     result = json.dumps({"error": str(exc)[:500]}, ensure_ascii=False)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
