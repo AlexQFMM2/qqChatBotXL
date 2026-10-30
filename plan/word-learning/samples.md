@@ -159,3 +159,17 @@ Bring a reusable water bottle to reduce plastic waste.
 ```
 
 学习节奏处理对比在 `observations/word-learning-pace-20261030/`；实际旧 WAV 经同一处理后为 1.32–1.62 秒，保持音调并加入前后停顿。未以时长检查代替人工发音试听。
+
+### 新版线上音频
+
+2026-10-30 13:29 发布后，经真实语音接口生成（没有平台发送）：
+
+| 单词 | 新版 WAV 时长 | 本机样本 |
+|---|---|---|
+| unhappy | 1.521s | `observations/word-learning-pace-live-20261030/unhappy.wav` |
+| reusable | 1.622s | `observations/word-learning-pace-live-20261030/reusable.wav` |
+| apple | 1.322s | `observations/word-learning-pace-live-20261030/apple.wav` |
+| record | 1.521s | `observations/word-learning-pace-live-20261030/record.wav` |
+| read | 1.322s | `observations/word-learning-pace-live-20261030/read.wav` |
+
+均验证开头 200ms、结尾 350ms 静音，中间有声音；另有 `reusable.silk` 实际生成样本。此处路径相对仓库根且被 Git 忽略，需本机访问；真人清晰度和发音准确性待反馈。

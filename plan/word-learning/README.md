@@ -86,3 +86,17 @@
 - 真实主模型最终 11/11 流程通过（语音模拟、平台发送模拟）：固定栏目、可选自然引入、纯文字、明确不要开场白、错拼、多词、普通聊天、追问重读。重读选中 word 模式，读音预算和顺序符合预期。完整记录 `observations/word-learning-pace-release-20261030/`，未写入私人聊天或凭据。
 - 内容抽查：reusable 的引入、构词、释义与例句符合要求，无开场白请求返回直接卡片。过程中模型仍出现不必要的拼写提示、专名扩展等内容波动，已收紧规则与字段说明；11/11 仅表示执行流程通过，不把提示词当作词典事实校验，内容验收继续保留。
 - 按既有 ai-code-review 流程复核变更：普通语音请求仍省略 mode；单词模式限制与校验先于付费合成；QQ / 微信在同一处理后 PCM 上编码；opening 接受同样单行/长度/控制标记校验并计入整卡长度，解析保持程序排版。没有发现阻止本次试用发布的代码问题。
+
+## T-006 已推送上线（2026-10-30 13:29，北京时间）
+
+- 提交 `e7acd8949c935c61b99b33c80aa27fd531dc3ed7` 已推送 main。源码归档 SHA-256：`1bad1ad2de2dec3e933eeec4d5e604c17b150f77f426decfe28f9ef13278ccfe`，132 个跟踪文件逐项验证。服务器原语音实现与仓库基线相同，依赖、参考音、人格均核对一致。
+- 机器人镜像 `qqchat:word-pace-e7acd89`，ID `sha256:e47d851aa0bebdc208ed52c7f6a0ff1fe824e0b06d5156887d32022491f61695`；语音镜像 `qqchat-voice:word-pace-e7acd89`，ID `sha256:79da59eaca287559160e69180f69cb72bebdba9d1ffede14a2dfb51565483d9e`。分别基于上一固定镜像离线构建，无供应商或依赖变更。
+- 应用候选运行 379 项，OK（2 项实际音频检查因应用镜像不含 FFmpeg/pilk 跳过）；语音候选运行 4 项，全部通过，覆盖应用镜像跳过的真实 FFmpeg 保音调/停顿及 SILK 时长验证。不能把跳过写成执行通过。
+- 按“语音适配器 → 微信 → QQ”逐个更新，等待现有请求完成；三个服务 healthy、运行源码一致、自动重启与错误 0。微信新轮询/登录及 QQ 回调就绪，共享记忆 ready。非目标服务的容器 ID/启动时间保持不变。
+- 仅更改 `.release.env` 的 `QQCHAT_IMAGE`、`QQCHAT_BUILD_CONTEXT`、`QQCHAT_VOICE_IMAGE`、`QQCHAT_VOICE_BUILD_CONTEXT`。复核无环境漂移，模型、音色、权限、账号、数据卷保持原配置，没有重新登记声音。
+- 上线后通过真实现有语音接口生成五个 WAV 和一个 SILK，未发送平台消息：WAV 均 24 kHz/16-bit/单声道、开头至少 200ms 静音、结尾至少 350ms 静音且中段有声音；unhappy 1.521s、reusable 1.622s、apple 1.322s、record 1.521s、read 1.322s。语音日志确认 mode=word。真实 reusable SILK 由生产镜像内 pilk 复核为 1,620ms；13:30 复核三个服务均 healthy、无环境漂移/重启/错误，结果见 postcheck.json。
+- 本机实际音频在 `observations/word-learning-pace-live-20261030/`，未纳入 Git；这是格式、节奏和链路验收，尚未替代用户的手机试听。T-004/T-005/T-006 及总计划仍为进行中，等待新节奏、清晰度及夏莉语气反馈。
+- 发布证据目录：服务器 `/home/ubuntu/qqChat/releases/word-pace-e7acd89/`，保留 manifest/源码归档、两个构建配方与日志、候选测试、逐服务部署记录、audio-probe.json、SILK 样本和 postcheck.json。
+- 回滚配置：服务器 `/home/ubuntu/qqChat/deploy-backups/word-pace-e7acd89/`，受限权限保存发布配置及容器元信息。恢复其 `.release.env` 后，依次对 QQ、微信、语音适配器使用既有 Compose `up -d --no-deps --no-build --pull never`：机器人退回 `qqchat:word-learning-bf22a13`，语音退回 `qqchat-voice:media-e81eedc81e00`。不回退数据库、账号、游标或聊天数据，不执行整个项目 down。
+
+用户现在可复测“解读 reusable”“再读一下”，或“解读 reusable，只要解析，不要开场白”。
