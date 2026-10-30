@@ -20,7 +20,7 @@ WORD_CARD_TOOL = {
     "name": "submit_word_card",
     "description": (
         "用户明确要求解读/讲解一个英文单词时，提交完整的结构化单词卡片作为本轮最终回复。"
-        "程序固定排版并先发文字，再按权限朗读 word；不要另外调用 send_voice 或附加闲聊。"
+        "opening 用一句自然的夏莉语气引入，解析栏目由程序固定排版，再按权限朗读 word；不要另外调用 send_voice。"
         "默认 pronounce=true，用户只要文字时设 false。拼写错误先确认，多词/短语/混合任务先请拆开。"
         "本工具成功后结束本轮，不与其他发送工具混用；词源或音标不确定必须直说。"
     ),
@@ -28,9 +28,10 @@ WORD_CARD_TOOL = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "opening": _string_schema(80, "一句简短自然的夏莉式引入，结合当前单词/对话，不套固定台词；称呼遵守已验证身份。用户只要解析时省略"),
             "word": _string_schema(64, "单个英文词，可含连字符或撇号；保留用户要求的正确拼写"),
-            "ipa_uk": _string_schema(180, "英音 IPA；多读音注明词性/时态；未知写未确认"),
-            "ipa_us": _string_schema(180, "美音 IPA；多读音注明词性/时态；未知写未确认"),
+            "ipa_uk": _string_schema(180, "英音 IPA；多读音注明词性/时态，逐个核对重音和元音；不确定写未确认"),
+            "ipa_us": _string_schema(180, "美音 IPA；多读音注明词性/时态，逐个核对重音和元音，不把非 r 化元音随意改成 /ər/；不确定写未确认"),
             "meanings": {
                 "type": "array", "minItems": 1, "maxItems": 3,
                 "items": {
@@ -42,7 +43,7 @@ WORD_CARD_TOOL = {
                     "required": ["part_of_speech", "translation"],
                 },
             },
-            "formation": _string_schema(400, "一两句说明可确认的前缀/词根/基础词/后缀及含义；无明显结构时直说，不叙述历史沿革或读音演变"),
+            "formation": _string_schema(400, "仅列可确认的构词部分及含义 → 整体含义；无明显结构写‘无明显可拆分结构，可作为整体词记忆’。不附带历史词源、读音演变、拼写规则、字母数量或其他学习技巧"),
             "example_en": _string_schema(240, "一条包含该词、自然且对应所讲词义的英文例句"),
             "example_zh": _string_schema(240, "例句的中文翻译"),
             "pronounce": {"type": "boolean", "default": True,
@@ -84,6 +85,7 @@ class WordCard:
     example_en: str
     example_zh: str
     pronounce: bool = True
+    opening: str = ""
 
     def render(self, *, max_chars: int, voice_note: str = "") -> str:
         multiple = len(self.meanings) > 1
@@ -100,6 +102,8 @@ class WordCard:
             f"\n\n翻译\n{translations}\n\n词性\n{parts}"
             f"\n\n构词拆解\n{self.formation}\n\n例句\n{self.example_en}\n{self.example_zh}"
         )
+        if self.opening:
+            text = self.opening + "\n\n" + text
         if voice_note:
             text += "\n\n读音\n" + voice_note
         if len(text) > max_chars:
@@ -131,7 +135,10 @@ def parse_word_card(arguments: dict) -> WordCard:
     fields = {name: _text(arguments[name], name, limit) for name, limit in (
         ("ipa_uk", 180), ("ipa_us", 180), ("formation", 400), ("example_en", 240), ("example_zh", 240),
     )}
-    return WordCard(word=word, meanings=tuple(meanings), pronounce=pronounce, **fields)
+    opening = arguments.get("opening", "")
+    if opening != "":
+        opening = _text(opening, "opening", 80)
+    return WordCard(word=word, meanings=tuple(meanings), pronounce=pronounce, opening=opening, **fields)
 
 
 def check_requested_word(card: WordCard, current_message: str) -> None:

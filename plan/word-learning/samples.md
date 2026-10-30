@@ -131,3 +131,31 @@ She likes to read for a while before going to bed.
 文本已核对，但模型生成仍可能出现事实错误，不能把样本通过当作词典级准确性保证。初轮曾出现 record 美音动词音标错误，经收紧规则后最终样本正确，原始结果保留在本机 observations 中。
 
 音频和 JSON 位于被忽略的 observations/，不随 Git 上传；本页只保存合成样本文字与本机音频链接。发布前仍需真人听音和用户手机验收。
+
+## 试用反馈修订样本（2026-10-30）
+
+真实模型、合成身份、模拟平台及语音；来源 `observations/word-learning-pace-release-20261030/reusable.json`。引入放在固定解析前；“只要解析，不要开场白”用例也已验证直接从单词开始。
+
+```text
+老师，这个词拆开看就很清楚，环保话题里也常能见到它。
+
+reusable
+
+音标
+英 /ˌriːˈjuːzəbl/ ｜ 美 /ˌriːˈjuːzəbl/
+
+翻译
+可重复使用的；可再次使用的
+
+词性
+adj. 形容词
+
+构词拆解
+前缀 re-（再、重新）+ 基础词 use（使用）+ 后缀 -able（可……的）→ 可以再次使用的
+
+例句
+Bring a reusable water bottle to reduce plastic waste.
+带上可重复使用的水瓶，减少塑料垃圾。
+```
+
+学习节奏处理对比在 `observations/word-learning-pace-20261030/`；实际旧 WAV 经同一处理后为 1.32–1.62 秒，保持音调并加入前后停顿。未以时长检查代替人工发音试听。

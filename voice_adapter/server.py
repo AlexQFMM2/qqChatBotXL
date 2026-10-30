@@ -22,6 +22,9 @@ from aiohttp import web
 
 LOGGER = logging.getLogger(__name__)
 VOICE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{6,256}$")
+WORD_SPEECH_TEMPO = 0.8
+WORD_LEADING_SILENCE_MS = 200
+WORD_TRAILING_SILENCE_MS = 350
 
 
 class AdapterError(RuntimeError):
@@ -319,6 +322,36 @@ async def _decode_to_pcm(audio: bytes) -> bytes:
     return stdout
 
 
+def _validate_speech_mode(text: str, mode: str) -> None:
+    if mode not in ("speech", "word"):
+        raise AdapterError("unsupported speech mode")
+    if mode == "word" and (len(text) > 64 or not re.fullmatch(r"[A-Za-z]+(?:[-'’][A-Za-z]+)*", text)):
+        raise AdapterError("word mode requires one English word (at most 64 characters)")
+
+
+async def _word_learning_pcm(pcm: bytes) -> bytes:
+    """Slower articulation at the original pitch, with room to catch the onset/end."""
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
+        "-af", (f"atempo={WORD_SPEECH_TEMPO},adelay={WORD_LEADING_SILENCE_MS}:all=1,"
+                f"apad=pad_dur={WORD_TRAILING_SILENCE_MS / 1000}"),
+        "-f", "s16le", "-ar", "24000", "-ac", "1", "pipe:1",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(process.communicate(pcm), timeout=15)
+    except TimeoutError as exc:
+        raise AdapterError("word pronunciation processing timed out", 502) from exc
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    if process.returncode != 0 or not stdout:
+        raise AdapterError("word pronunciation processing failed", 502)
+    return stdout
+
+
 def _encode_silk_sync(pcm: bytes) -> bytes:
     try:
         import pilk
@@ -416,9 +449,11 @@ class VoiceService:
             LOGGER.info("voice enrollment completed")
             return voice_id
 
-    async def synthesize(self, text: str, *, audio_format: str = "silk", fusion_model: str | None = None) -> bytes:
+    async def synthesize(self, text: str, *, audio_format: str = "silk", fusion_model: str | None = None,
+                         mode: str = "speech") -> bytes:
         if audio_format not in {"silk", "wav"}:
             raise AdapterError("unsupported audio format")
+        _validate_speech_mode(text, mode)
         if fusion_model:
             if not self.settings.fusion_base_url or not fusion_model.startswith("Fusion/"):
                 raise AdapterError("Fusion voice route is not configured")
@@ -474,6 +509,8 @@ class VoiceService:
             pcm = await _decode_to_pcm(audio)
         if len(pcm) * 1000 // (24000 * 2) < minimum_duration_ms:
             raise AdapterError("generated audio is implausibly short", 502)
+        if mode == "word":
+            pcm = await _word_learning_pcm(pcm)
         if audio_format == "wav":
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wav:
@@ -487,12 +524,13 @@ class VoiceService:
         if len(encoded) > self.settings.max_audio_bytes:
             raise AdapterError("encoded audio exceeds size limit", 502)
         LOGGER.info(
-            "voice audio prepared: source=%d bytes, pcm=%d bytes, encoded=%d bytes, duration=%d ms, format=%s",
+            "voice audio prepared: source=%d bytes, pcm=%d bytes, encoded=%d bytes, duration=%d ms, format=%s, mode=%s",
             len(audio),
             len(pcm),
             len(encoded),
             len(pcm) * 1000 // (24000 * 2),
             audio_format,
+            mode,
         )
         return encoded
 
@@ -548,7 +586,11 @@ async def voice_speech(request: web.Request) -> web.Response:
     audio_format = body.get("format", "silk")
     if audio_format not in ("silk", "wav"):
         raise AdapterError("unsupported audio format")
+    mode = body.get("mode", "speech")
+    _validate_speech_mode(text, mode)
     kwargs = {"audio_format": audio_format}
+    if mode != "speech":
+        kwargs["mode"] = mode
     if is_fusion:
         kwargs["fusion_model"] = model
     audio = await service.synthesize(text, **kwargs)

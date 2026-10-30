@@ -33,6 +33,7 @@ class ProbeLLM(LLMClient):
         self.synthesize = synthesize
         self.calls = []
         self.spoken = []
+        self.speech_modes = []
 
     async def complete_with_tools(self, system, prompt, tools, execute, **kwargs):
         async def traced(name, arguments):
@@ -49,12 +50,13 @@ class ProbeLLM(LLMClient):
 
     async def generate_voice(self, text, **kwargs):
         self.spoken.append(text)
+        self.speech_modes.append(kwargs.get("mode", "speech"))
         if self.synthesize:
             return await super().generate_voice(text, **kwargs)
         return b"simulated voice; not an audio acceptance sample"
 
 
-async def run_case(session, args, label, question, expected_word, *, text_only=False, followup=False):
+async def run_case(session, args, label, question, expected_word, *, text_only=False, followup=False, no_opening=False):
     with tempfile.TemporaryDirectory(prefix="word-learning-probe-") as directory:
         settings = replace(Settings.from_env(channel="wechat"),
             persona_path=str(ROOT / "persona.md"), database_path=directory + "/chat.db",
@@ -97,17 +99,21 @@ async def run_case(session, args, label, question, expected_word, *, text_only=F
                  and all("\n" + heading + "\n" in event["text"] for heading in ("音标", "翻译", "词性", "构词拆解", "例句"))]
         audio_events = [event for event in events if event["kind"] == "audio"]
         if followup:
-            ok = "send_voice" in accepted and not cards and llm.spoken == [expected_word] and len(audio_events) == 1
+            ok = ("send_voice" in accepted and not cards and llm.spoken == [expected_word]
+                  and llm.speech_modes == ["word"] and len(audio_events) == 1)
         elif expected_word:
             ok = (accepted.count("submit_word_card") == 1 and len(cards) == 1
-                  and cards[0]["text"].startswith(expected_word + "\n"))
+                  and 0 <= cards[0]["text"].find(expected_word + "\n\n音标\n") <= 82)
+            if no_opening:
+                ok = ok and cards[0]["text"].startswith(expected_word + "\n\n音标\n")
             ok = ok and (llm.spoken == [] if text_only else llm.spoken == [expected_word])
+            ok = ok and (llm.speech_modes == [] if text_only else llm.speech_modes == ["word"])
             ok = ok and ([event["kind"] for event in events] == (["text"] if text_only else ["text", "audio"]))
         else:
             ok = bool(events) and not cards and not llm.spoken and "submit_word_card" not in accepted
         report = {"case": label, "question": question, "execution_ok": bool(ok and not error),
                   "error": error, "audio_mode": "live" if args.synthesize else "simulated",
-                  "tools": llm.calls, "spoken": llm.spoken, "events": events}
+                  "tools": llm.calls, "spoken": llm.spoken, "speech_modes": llm.speech_modes, "events": events}
         (args.output_dir / (label + ".json")).write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         print(json.dumps(report, ensure_ascii=False), flush=True)
         return report["execution_ok"]
@@ -120,6 +126,7 @@ async def main(args):
         for word in ("unhappy", "reusable", "apple", "record", "read"):
             outcomes.append(await run_case(session, args, word, "解读 " + word, word))
         outcomes.append(await run_case(session, args, "text-only", "解读 unhappy，只要文字，不要语音", "unhappy", text_only=True))
+        outcomes.append(await run_case(session, args, "no-opening", "解读 reusable，只要解析，不要开场白，不要语音", "reusable", text_only=True, no_opening=True))
         for label, question in (
             ("typo", "解读 recieve"), ("batch", "解读 apple 和 record"),
             ("ordinary", "今天买了一个 apple，挺甜的。"),

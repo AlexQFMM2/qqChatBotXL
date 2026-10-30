@@ -8,8 +8,8 @@
 |---|---|---|
 | `understand_images` | `question`：需要观察什么 | 从本会话最近用户图片消息选择合法附件，调用配置的识图能力，返回观察文字；不发送图片 |
 | `generate_image` | `prompt`：画面描述；`reference`：`none`、`current`、`self` 或 `current_and_self` | CCR 生成/编辑图片 → 下载验证与渠道压缩 → 发图；返回 `status: sent`、`kind: image`、工作区相对路径 |
-| `send_voice` | `text`：朗读内容，长度受配置限制 | CCR 合成 → 既有语音适配器转码 → QQ SILK / 微信 WAV；返回 `status: sent`、`kind: voice` |
-| `submit_word_card` | `word`、`ipa_uk`、`ipa_us`、`meanings`（词性与释义）、`formation`、`example_en`、`example_zh`、`pronounce`（默认 true） | 校验并作为本轮最终回复结束工具循环；程序先发固定文字卡片，再按既有语音权限朗读单词，不另调 `send_voice` |
+| `send_voice` | `text`：朗读内容；可选 `mode=speech|word`，默认 speech | CCR 合成 → 既有语音适配器转码 → QQ SILK / 微信 WAV；word 只接受单个英文词，采用保音调 0.8 倍速及前后停顿，供单词追问重读使用；返回 `status: sent`、`kind: voice` |
+| `submit_word_card` | `word`、`ipa_uk`、`ipa_us`、`meanings`（词性与释义）、`formation`、`example_en`、`example_zh`、`pronounce`（默认 true）；可选 `opening`（最多 80 字符） | 校验并作为本轮最终回复结束工具循环；程序先发自然引入＋固定解析，再按既有语音权限用 word 模式朗读单词，不另调 `send_voice` |
 | `research` / `web_search` / `fetch_url` / `get_weather` | 问题、关键词、公开 URL 或地区 | 沿用现有联网服务，返回来源和证据，由主模型判断如何回答 |
 | `recent_requests` | 无 | 需要延续旧任务时，返回本会话最近 100 条里当前用户的原话及北京时间的记录时间，最多 12,000 字，保留完整条目；不跨会话 |
 
@@ -42,6 +42,7 @@ CCR 返回可下载的图片地址。机器人检查 HTTPS 域名、下载大小
 - 单词卡片的文字能力面向可聊天成员；读音与 `send_voice` 共用权限、长度和每条消息一次的预算。卡片不能与已执行的媒体发送混用。无权限/未启用语音时仍发完整文字；用户要求纯文字时不附多余提示。
 - `submit_word_card` 返回内部 `FinalToolReply`，两种协议直接结束循环，不执行同批后续工具，也不要求模型再次总结。工具准备阶段不发送消息；最终发送沿用脱敏与记忆撤销检查。校验失败可在现有轮次内修正，超长卡片不能靠截断发送。
 - 单词卡片成功发送后才合成读音；合成失败追加简短失败说明，渠道发送不明停止后续动作。卡片与音频分别沿用现有历史记录，不增加数据库表。
+- `/v1/voice-speech` 增加可选 `mode=word`；旧请求默认 speech，保持原行为。语音适配器自行处理学习节奏，CCR 的模型、音色和供应商请求均不变。原音频过短先报错，不能用补静音掩盖截断。word 模式最大 64 字符、单个英文词；更新时先部署兼容适配器，再更新机器人。
 - QQ 的主模型任务使用现有有界后台队列；微信使用自身持久收件队列。选中耗时媒体工具后才发对应进度，普通聊天不承诺画图/发声。
 - 图片与文件来源局限当前会话；发出的表情不自动进入用户图片上下文。记忆撤销检查覆盖工具执行与最终发送。
 - 发送结果不明或登录失效时停止该条消息后续操作，不能自动重发。跨消息重试必须由新入站请求提供上下文。

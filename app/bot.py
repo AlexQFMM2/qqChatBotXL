@@ -191,8 +191,11 @@ IMAGE_TOOL = {
 }
 VOICE_TOOL = {
     "name": "send_voice",
-    "description": "把 text 用夏莉声音朗读并直接发送。QQ 是语音，微信是可播放 WAV 附件；只支持说话/朗读，不支持带旋律唱歌。每条消息最多一次。",
-    "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    "description": "把 text 用夏莉声音朗读并直接发送。QQ 是语音，微信是可播放 WAV 附件；只支持说话/朗读，不支持带旋律唱歌。单个英文词及追问重读用 mode=word，以从容的学习语速发音；普通说话默认 speech。每条消息最多一次。",
+    "input_schema": {"type": "object", "properties": {
+        "text": {"type": "string"},
+        "mode": {"type": "string", "enum": ["speech", "word"], "default": "speech"},
+    }, "required": ["text"]},
 }
 RECENT_REQUESTS_TOOL = {
     "name": "recent_requests",
@@ -1110,8 +1113,14 @@ class PersonaBot:
                             arguments.setdefault("reference", "none")
                             if arguments["reference"] not in schema["properties"]["reference"]["enum"]:
                                 raise WorkspaceError("不支持的参考图片来源。")
-                        if any(len(value) > (self._settings.voice_max_chars if name == "send_voice" else 4000)
-                               for value in arguments.values()):
+                        if name == "send_voice":
+                            arguments.setdefault("mode", "speech")
+                            if arguments["mode"] not in {"speech", "word"}:
+                                raise WorkspaceError("不支持的朗读方式。")
+                            if arguments["mode"] == "word" and not re.fullmatch(r"[A-Za-z]+(?:[-'’][A-Za-z]+)*", arguments["text"]):
+                                raise WorkspaceError("单词学习朗读只接受一个英文词；普通语句请使用 speech。")
+                        if any(len(value) > (self._settings.voice_max_chars if name == "send_voice" and key == "text" else 4000)
+                               for key, value in arguments.items()):
                             raise WorkspaceError("工具文字超长，请缩短后调用。")
                         key = name + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
                         if key in media_results:
@@ -1163,7 +1172,7 @@ class PersonaBot:
                                         "note": "图片已生成且渠道发送接口成功，不要重复发送"}, ensure_ascii=False)
                                 else:
                                     await self._send_voice(group_id, message_id, arguments["text"], sequence=sequence,
-                                        audio_format="wav" if message.channel == "wechat" else "silk")
+                                        audio_format="wav" if message.channel == "wechat" else "silk", mode=arguments["mode"])
                                     result = '{"status":"sent","kind":"voice","note":"音频已合成且渠道发送接口成功"}'
                             media_results[key] = result
                             ROUTING_LOGGER.info("工具执行：tool=%s success=true channel=%s", name, message.channel)
@@ -2010,7 +2019,7 @@ class PersonaBot:
             raise TransportError("文字发送状态未确认，停止单词读音。")
         try:
             await self._send_voice(group_id, message_id, card.word,
-                                   sequence=sequence + 1, audio_format=audio_format)
+                                   sequence=sequence + 1, audio_format=audio_format, mode="word")
         except LLMError as exc:
             ROUTING_LOGGER.warning("单词读音：speech=failed error=%s", type(exc).__name__)
             await self._send(group_id, message_id, "本次单词读音生成失败，文字解读已保留。",
@@ -2024,6 +2033,7 @@ class PersonaBot:
         *,
         sequence: int = 1,
         audio_format: str = "silk",
+        mode: str = "speech",
     ) -> None:
         memory = getattr(self, '_memory', None)
         if memory and not memory.valid():
@@ -2036,6 +2046,7 @@ class PersonaBot:
             model=self._media_model(self._settings.voice_model),
             max_bytes=self._settings.voice_max_mb * 1024 * 1024,
             audio_format=audio_format,
+            **({"mode": mode} if mode != "speech" else {}),
         )
         if memory and not memory.valid():
             raise TransportError("语音使用的长期记忆已失效，未发送。")

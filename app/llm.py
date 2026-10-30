@@ -394,6 +394,7 @@ class LLMClient:
         model: str,
         max_bytes: int,
         audio_format: str = "silk",
+        mode: str = "speech",
     ) -> bytes:
         """Synthesize a short reply through the authenticated voice adapter."""
         value = text.strip()
@@ -401,7 +402,11 @@ class LLMClient:
             raise LLMError("语音文本不能为空")
         if audio_format not in {"silk", "wav"}:
             raise LLMError("不支持的语音输出格式")
+        if mode not in {"speech", "word"}:
+            raise LLMError("不支持的朗读方式")
         payload = {"model": model, "text": value}
+        if mode != "speech":
+            payload["mode"] = mode
         if getattr(self._settings, "media_route", "direct") == "fusion":
             payload["model"] = self._settings.llm_model
         if audio_format != "silk":

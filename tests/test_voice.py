@@ -146,6 +146,17 @@ class FakeVoiceSession:
 
 
 class VoiceClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_word_mode_is_explicit_and_ordinary_speech_payload_stays_compatible(self):
+        session = FakeVoiceSession(b"\x02#!SILK_V3payload")
+        client = LLMClient(SimpleNamespace(llm_base_url="https://example.test", llm_api_key="fake"), session)
+        await client.generate_voice("apple", model="voice", max_bytes=1024, mode="word")
+        self.assertEqual(session.calls[-1]["json"]["mode"], "word")
+        await client.generate_voice("你好", model="voice", max_bytes=1024)
+        self.assertNotIn("mode", session.calls[-1]["json"])
+        with self.assertRaises(LLMError):
+            await client.generate_voice("apple", model="voice", max_bytes=1024, mode="invalid")
+        self.assertEqual(len(session.calls), 2)
+
     async def test_accepts_playable_wav_and_requests_correct_format(self) -> None:
         buf=io.BytesIO()
         with wave.open(buf,'wb') as wav:
@@ -224,6 +235,37 @@ class VoiceFormatTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AdapterError):await service.synthesize('测试',audio_format='mp3')
         service.ensure_voice.assert_not_awaited()
 
+    async def test_word_audio_is_processed_before_both_encodings(self):
+        source = b"\x01\x00" * 24000
+        slower = b"\x02\x00" * 36000
+        service = self.service()
+        with patch("voice_adapter.server._decode_to_pcm", AsyncMock(return_value=source)), \
+             patch("voice_adapter.server._word_learning_pcm", AsyncMock(return_value=slower)) as prepare, \
+             patch("voice_adapter.server._encode_silk_sync", return_value=b"\x02#!SILK_V3payload") as encode:
+            audio = await service.synthesize("apple", audio_format="wav", mode="word")
+            with wave.open(io.BytesIO(audio)) as wav:
+                self.assertEqual(wav.readframes(wav.getnframes()), slower)
+            await service.synthesize("apple", mode="word")
+            encode.assert_called_once_with(slower)
+            self.assertEqual(prepare.await_count, 2)
+            await service.synthesize("你好", audio_format="wav")
+            self.assertEqual(prepare.await_count, 2)
+
+    async def test_silence_padding_cannot_mask_a_truncated_source(self):
+        service = self.service()
+        with patch("voice_adapter.server._decode_to_pcm", AsyncMock(return_value=b"\0\0" * 100)), \
+             patch("voice_adapter.server._word_learning_pcm", AsyncMock()) as prepare:
+            with self.assertRaisesRegex(AdapterError, "implausibly short"):
+                await service.synthesize("apple", mode="word")
+            prepare.assert_not_awaited()
+
+    async def test_invalid_word_modes_rejected_before_paid_synthesis(self):
+        service = self.service()
+        for text, mode in (("apple", "invalid"), ("two words", "word"), ("a" * 65, "word")):
+            with self.subTest(text=text, mode=mode), self.assertRaises(AdapterError):
+                await service.synthesize(text, mode=mode)
+        service.ensure_voice.assert_not_awaited()
+
     async def test_voice_endpoint_validates_format_and_preserves_default(self):
         service=SimpleNamespace(synthesize=AsyncMock(return_value=b'audio'))
         request=SimpleNamespace(app={'settings':SimpleNamespace(client_api_key='fake',voice_model='voice',max_text_chars=240),
@@ -236,6 +278,21 @@ class VoiceFormatTests(unittest.IsolatedAsyncioTestCase):
         service.synthesize.reset_mock()
         request.json.return_value={'model':'voice','text':'测试','format':'invalid'}
         with self.assertRaises(AdapterError):await voice_speech(request)
+        service.synthesize.assert_not_awaited()
+
+    async def test_endpoint_forwards_valid_word_mode_and_rejects_invalid_mode(self):
+        service = SimpleNamespace(synthesize=AsyncMock(return_value=b"audio"))
+        request = SimpleNamespace(app={"settings":SimpleNamespace(client_api_key="fake",voice_model="voice",max_text_chars=240),
+            "voice_service":service}, headers={"Authorization":"Bearer fake"}, json=AsyncMock())
+        request.json.return_value = {"model":"voice", "text":"apple", "mode":"word", "format":"wav"}
+        await voice_speech(request)
+        service.synthesize.assert_awaited_once_with("apple", audio_format="wav", mode="word")
+        service.synthesize.reset_mock()
+        for body in ({"text":"two words", "mode":"word"}, {"text":"apple", "mode":"bad"},
+                     {"text":"apple", "mode":False}, {"text":"apple", "mode":[]}):
+            request.json.return_value = {"model":"voice", **body}
+            with self.subTest(body=body), self.assertRaises(AdapterError):
+                await voice_speech(request)
         service.synthesize.assert_not_awaited()
 
 

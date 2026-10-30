@@ -273,6 +273,22 @@ class ControllerToolsTests(unittest.IsolatedAsyncioTestCase):
         await self.process(message('语音回复'))
         self.llm.generate_voice.assert_not_awaited()
 
+    async def test_word_repeat_selects_learning_mode_and_rejects_sentence(self):
+        self.bot._settings = replace(self.settings, voice_enabled=True)
+        self.llm.generate_voice = AsyncMock(return_value=b"audio")
+        self.transport.media.upload = AsyncMock(return_value={"type":4,"file_item":{}})
+        async def controller(system, prompt, tools, execute, **kwargs):
+            with self.assertRaises(WorkspaceError):
+                await execute("send_voice", {"text":"read this sentence", "mode":"word"})
+            with self.assertRaises(WorkspaceError):
+                await execute("send_voice", {"text":"unhappy", "mode":"invalid"})
+            await execute("send_voice", {"text":"unhappy", "mode":"word"})
+            return "读给你听了。"
+        self.llm.complete_with_tools.side_effect = controller
+        await self.process(message("再读一下 unhappy"))
+        self.llm.generate_voice.assert_awaited_once()
+        self.assertEqual(self.llm.generate_voice.await_args.kwargs["mode"], "word")
+
     async def test_disabled_edit_is_not_advertised_and_invalid_selection_does_not_use_budget(self):
         self.fake_drawing()
         self.bot._settings = replace(self.bot._settings, image_edit_enabled=False)

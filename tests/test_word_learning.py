@@ -48,6 +48,18 @@ class WordCardTests(unittest.TestCase):
         self.assertIn("词性\n1. n. 名词\n2. v. 动词", text)
         self.assertIn("n. /ˈrekɔːd/；v. /rɪˈkɔːd/", text)
 
+    def test_personal_opening_does_not_change_structured_explanation(self):
+        original = parse_word_card(sample_card()).render(max_chars=1500)
+        opening = "老师，这个词拆开就好记啦，我们一起看。"
+        text = parse_word_card(sample_card(opening=opening)).render(max_chars=1500)
+        self.assertEqual(text, opening + "\n\n" + original)
+        self.assertEqual(parse_word_card(sample_card(opening="")).render(max_chars=1500), original)
+        for value in (None, False, "x" * 81, "两行\n开场", "[[EMOTE:害羞]]"):
+            with self.subTest(value=value), self.assertRaises(WordCardError):
+                parse_word_card(sample_card(opening=value))
+        with self.assertRaises(WordCardError):
+            parse_word_card(sample_card(opening=opening)).render(max_chars=len(original))
+
     def test_unknown_phonetics_and_no_structure_are_explicit(self):
         text = parse_word_card(sample_card(word="apple", ipa_uk="未确认", ipa_us="未确认",
             formation="无明显可拆分结构")).render(max_chars=1500)
@@ -174,6 +186,7 @@ class WordCardControllerTests(unittest.IsolatedAsyncioTestCase):
         self.llm.generate_voice.assert_awaited_once()
         self.assertEqual(self.llm.generate_voice.await_args.args, ("unhappy",))
         self.assertEqual(self.llm.generate_voice.await_args.kwargs["audio_format"], "wav")
+        self.assertEqual(self.llm.generate_voice.await_args.kwargs["mode"], "word")
         self.assertEqual([call.args[2]["type"] for call in self.client.send.await_args_list], [1, 4])
         self.assertNotIn("正在生成语音", self.sent_text())
         history = await self.store.history(self.transport.conversation_id, 10)
@@ -194,6 +207,16 @@ class WordCardControllerTests(unittest.IsolatedAsyncioTestCase):
             "解读 unhappy", "解读 unhappy"), _from_task_queue=True)
         self.assertEqual(order, [("text", 1), ("voice", 2)])
         self.assertEqual(self.llm.generate_voice.await_args.kwargs["audio_format"], "silk")
+        self.assertEqual(self.llm.generate_voice.await_args.kwargs["mode"], "word")
+
+    async def test_opening_is_sent_once_before_standard_card_then_word_audio(self):
+        opening = "这个词其实挺好拆的，老师看这里。"
+        self.prepare(card=sample_card(opening=opening))
+        await self.process(wechat_tests.message("解读 unhappy"))
+        self.assertTrue(self.sent_text().startswith(opening + "\n\nunhappy\n\n音标\n"))
+        self.assertEqual(self.sent_text().count(opening), 1)
+        self.assertEqual([c.args[2]["type"] for c in self.client.send.await_args_list], [1, 4])
+        self.assertEqual(self.llm.generate_voice.await_args.args, ("unhappy",))
 
     async def test_explicit_text_only_has_no_voice_note_or_paid_call(self):
         self.prepare(card=sample_card(pronounce=False))
