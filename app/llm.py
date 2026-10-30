@@ -24,6 +24,10 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMOutputLimitError(LLMError):
+    """A length-limited response must not be delivered or executed as complete."""
+
+
 @dataclass(frozen=True, slots=True)
 class FinalToolReply:
     """A validated reply owned by the application; no further model/tools are needed."""
@@ -175,7 +179,7 @@ class LLMClient:
                 "messages": messages,
                 "tools": tools,
             }
-            data = await self._post(url, headers, payload)
+            data = await self._chat_post(url, headers, payload)
             content = data.get("content") or []
             if not isinstance(content, list):
                 raise LLMError("工具调用响应格式不正确")
@@ -202,13 +206,13 @@ class LLMClient:
                 )
                 recovery_payload = {
                     "model": model or self._settings.llm_model,
-                    "max_tokens": self._recovery_max_tokens(),
+                    "max_tokens": self._settings.llm_max_tokens,
                     "temperature": min(self._settings.llm_temperature, 0.4),
                     "thinking": {"type": "disabled"},
                     "system": system,
                     "messages": messages,
                 }
-                recovery_data = await self._post(url, headers, recovery_payload)
+                recovery_data = await self._chat_post(url, headers, recovery_payload)
                 recovery_content = recovery_data.get("content") or []
                 recovery_text = "".join(
                     str(part.get("text", ""))
@@ -267,7 +271,7 @@ class LLMClient:
             "system": system,
             "messages": messages,
         }
-        final_data = await self._post(url, headers, final_payload)
+        final_data = await self._chat_post(url, headers, final_payload)
         final_content = final_data.get("content") or []
         final_text = "".join(
             str(part.get("text", ""))
@@ -297,7 +301,7 @@ class LLMClient:
                        "temperature": self._settings.llm_temperature, "messages": messages}
             if with_tools:
                 payload["tools"] = definitions
-            data = await self._post(self._endpoint("chat/completions"), headers, payload)
+            data = await self._chat_post(self._endpoint("chat/completions"), headers, payload)
             try:
                 message = data["choices"][0]["message"]
                 if not isinstance(message, dict):
@@ -335,9 +339,6 @@ class LLMClient:
         if not isinstance(text, str) or not text.strip():
             raise LLMError("工具执行后模型没有返回最终文本")
         return text.strip()
-
-    def _recovery_max_tokens(self) -> int:
-        return min(8192, max(1600, self._settings.llm_max_tokens * 2))
 
     @staticmethod
     def _log_empty_response(stage: str, data: dict) -> None:
@@ -520,14 +521,14 @@ class LLMClient:
                 {"role": "user", "content": _anthropic_user_content(user_prompt, images)}
             ],
         }
-        data = await self._post(url, headers, payload)
+        data = await self._chat_post(url, headers, payload)
         parts = data.get("content") or []
         text = "".join(str(part.get("text", "")) for part in parts if part.get("type") == "text")
         if not text.strip():
             self._log_empty_response("anthropic_initial", data)
             recovery_payload = {
                 **payload,
-                "max_tokens": self._recovery_max_tokens(),
+                "max_tokens": self._settings.llm_max_tokens,
                 "temperature": min(self._settings.llm_temperature, 0.4),
                 "system": (
                     system
@@ -535,7 +536,7 @@ class LLMClient:
                     "不要继续隐藏分析，不要调用工具，不要只输出思考过程。"
                 ),
             }
-            recovery_data = await self._post(url, headers, recovery_payload)
+            recovery_data = await self._chat_post(url, headers, recovery_payload)
             recovery_parts = recovery_data.get("content") or []
             text = "".join(
                 str(part.get("text", ""))
@@ -569,7 +570,7 @@ class LLMClient:
                 {"role": "user", "content": _openai_user_content(user_prompt, images)},
             ],
         }
-        data = await self._post(url, headers, payload)
+        data = await self._chat_post(url, headers, payload)
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -577,6 +578,53 @@ class LLMClient:
         if not str(text).strip():
             raise LLMError("模型返回中没有文本内容")
         return str(text)
+
+    async def _chat_post(self, url: str, headers: dict, payload: dict) -> dict:
+        """Retry a clipped model response once, before any text/tool is consumed."""
+        instruction = (
+            "\n\n上一份模型输出因达到生成额度而中止，未作为完整回复或工具调用执行。"
+            f"本次仍不得超过 {payload['max_tokens']} tokens，不增加额度。"
+            "立即输出精简且完整的最终回答，普通回复尽量在 300 个字符内概括全部要点并收尾；"
+            "不展开内部推理，不复制半截内容，不添加旁枝。"
+            "单词卡片仍须使用规定工具并保留全部字段；确需调用工具时参数要简短完整。"
+            "沿用对话里已经成功的工具结果，不重复执行成功操作，不把中止的调用当作成功。"
+        )
+        current = payload
+        for attempt in range(2):
+            data = await self._post(url, headers, current)
+            choices = data.get("choices") or []
+            limited = data.get("stop_reason") == "max_tokens" or any(
+                isinstance(choice, dict) and choice.get("finish_reason") == "length"
+                for choice in (choices if isinstance(choices, list) else [])
+            )
+            if not limited:
+                return data
+            LOGGER.warning("模型输出达到上限：max_tokens=%s attempt=%s", payload['max_tokens'], attempt + 1)
+            if attempt:
+                raise LLMOutputLimitError("模型压缩重答后仍达到输出上限，未采用不完整结果")
+            current = {**payload, "temperature": min(payload.get("temperature", 0.4), 0.4)}
+            parts = data.get("content") or []
+            has_text = any(isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+                           for part in (parts if isinstance(parts, list) else []))
+            has_calls = any(isinstance(part, dict) and part.get("type") == "tool_use"
+                            for part in (parts if isinstance(parts, list) else []))
+            for choice in (choices if isinstance(choices, list) else []):
+                message = choice.get("message", {}) if isinstance(choice, dict) else {}
+                if isinstance(message, dict):
+                    has_text = has_text or bool(message.get("content"))
+                    has_calls = has_calls or bool(message.get("tool_calls"))
+            if has_text and not has_calls:
+                # A clipped final answer only needs rewriting; don't reopen tools.
+                current.pop("tools", None)
+            if "system" in payload:
+                current["system"] = payload["system"] + instruction
+            else:
+                current["messages"] = [
+                    {**message, "content": message["content"] + instruction}
+                    if message.get("role") == "system" else message
+                    for message in payload["messages"]
+                ]
+        raise AssertionError("unreachable")
 
     def _endpoint(self, suffix: str) -> str:
         base = self._settings.llm_base_url.rstrip("/")

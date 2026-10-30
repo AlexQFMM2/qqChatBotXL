@@ -46,7 +46,7 @@ from .domain import (
     should_reply,
     strip_bot_mention,
 )
-from .llm import FinalToolReply, ImageInput, LLMClient, LLMError, VisionInputError
+from .llm import FinalToolReply, ImageInput, LLMClient, LLMError, LLMOutputLimitError, VisionInputError
 from .image_text import ImageTextError, apply_text_overlays, plan_image_text
 from .qq import QQClient
 from .storage import MemoryStore
@@ -1262,6 +1262,20 @@ class PersonaBot:
 
                 # Read the clock after any preparatory I/O, on every new turn.
                 persona += build_time_context()
+                persona += (
+                    "\n\n## 本轮回复长度预算\n"
+                    f"模型每次输出上限为 {self._settings.llm_max_tokens} tokens，"
+                    "token 不等于字符，中文、英文、音标及工具参数都会消耗额度。"
+                    f"最终文字回复最多 {self._settings.max_reply_chars} 个字符，"
+                    "包括开场白、栏目、标点、空格和换行；两项上限都必须满足。"
+                    f"普通回复尽量控制在 {min(600, self._settings.max_reply_chars * 3 // 4)} 个字符以内，"
+                    "复杂问题也先给覆盖全部要点的精简版。"
+                    "先规划篇幅，优先回答核心问题；多项比较要给每一项和结论留出空间。"
+                    "不要把上限当作必须写满的目标，省略重复解释和旁枝，为完整结尾留余量；"
+                    "在预算内把句子和意思说完，不依赖程序截断，也不以半句话或未写完的列表结束。"
+                    "单词卡片须保留全部固定栏目，精简各字段而非省略栏目。"
+                    "这些预算只用于组织回答，不向用户播报 token 或内部限制；保持夏莉自然的语气。"
+                )
                 if tools:
                     raw = await self._llm.complete_with_tools(
                         persona,
@@ -1340,7 +1354,13 @@ class PersonaBot:
                 LOGGER.exception("处理群消息失败")
                 notified = False
                 try:
-                    if isinstance(exc, BilibiliError):
+                    if isinstance(exc, LLMOutputLimitError):
+                        await self._send(
+                            group_id, message_id,
+                            "这次没能在限定篇幅内把内容整理完整。可以先聚焦其中一个问题，我再讲清楚。",
+                            sequence=next_sequence,
+                        )
+                    elif isinstance(exc, BilibiliError):
                         await self._send(
                             group_id,
                             message_id,
